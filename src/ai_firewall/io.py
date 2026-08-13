@@ -16,6 +16,13 @@ REQUIRED_COLUMNS = {
     "failed_connections_60s",
 }
 
+FLOW_COLUMNS = [
+    "timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
+    "duration_ms", "packets", "bytes_sent", "bytes_received", "syn_count",
+    "rst_count", "unique_dst_ports_60s", "connections_60s",
+    "failed_connections_60s", "label",
+]
+
 
 def read_flows(path: str | Path) -> list[FlowRecord]:
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
@@ -54,3 +61,13 @@ def write_jsonl(results: Iterable[DetectionResult], path: str | Path) -> None:
         for result in results:
             handle.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
 
+
+def write_flows_csv(flows: Iterable[FlowRecord], path: str | Path) -> None:
+    with Path(path).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FLOW_COLUMNS)
+        writer.writeheader()
+        for flow in flows:
+            writer.writerow({
+                name: "" if getattr(flow, name) is None else getattr(flow, name)
+                for name in FLOW_COLUMNS
+            })
