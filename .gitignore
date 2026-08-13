@@ -7,5 +7,7 @@ dist/
 build/
 *.egg-info/
 alerts.jsonl
+*-alerts.jsonl
+current-connections.jsonl
+flows.csv
 models/trained-*.json
-
