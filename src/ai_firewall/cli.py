@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from .detector import HybridDetector
-from .io import read_flows, write_jsonl
+from .io import read_flows, write_flows_csv, write_jsonl
 from .model import LinearModel
+from .pcap import read_pcap
 from .training import label_to_int, save_model, train_logistic_model
+from .windows_monitor import WindowsFlowTracker, collect_connections
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +47,24 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("input")
     evaluate.add_argument("--model", default=str(DEFAULT_MODEL))
     evaluate.add_argument("--threshold", type=float, default=0.60)
+
+    pcap = sub.add_parser("pcap", help="将 classic PCAP 转换为网络流 CSV")
+    pcap.add_argument("input")
+    pcap.add_argument("--output", default="flows.csv")
+    pcap.add_argument("--max-packets", type=int)
+    pcap.add_argument("--analyze", action="store_true", help="转换后立即运行检测")
+    pcap.add_argument("--alerts", default="pcap-alerts.jsonl")
+    pcap.add_argument("--model", default=str(DEFAULT_MODEL))
+    pcap.add_argument("--threshold", type=float, default=0.60)
+
+    monitor = sub.add_parser("monitor", help="实时监控 Windows TCP 连接")
+    monitor.add_argument("--interval", type=float, default=2.0)
+    monitor.add_argument("--duration", type=float, default=60.0, help="秒；0 表示持续运行")
+    monitor.add_argument("--once", action="store_true", help="只采集一次当前连接")
+    monitor.add_argument("--output", default="live-alerts.jsonl")
+    monitor.add_argument("--all", action="store_true", help="写入全部新连接，而不仅是告警")
+    monitor.add_argument("--model", default=str(DEFAULT_MODEL))
+    monitor.add_argument("--threshold", type=float, default=0.60)
     return parser
 
 
@@ -115,6 +136,58 @@ def run_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_pcap(args: argparse.Namespace) -> int:
+    flows = read_pcap(args.input, max_packets=args.max_packets)
+    write_flows_csv(flows, args.output)
+    print(f"已从 PCAP 聚合 {len(flows)} 条网络流，写入 {args.output}")
+    if args.analyze:
+        detector = _detector(args.model, args.threshold)
+        results = [detector.analyze(flow) for flow in flows]
+        alerts = [result for result in results if result.is_alert]
+        write_jsonl(alerts, args.alerts)
+        for result in results:
+            _print_result(result)
+        print(f"产生 {len(alerts)} 条告警，写入 {args.alerts}")
+    return 0
+
+
+def run_monitor(args: argparse.Namespace) -> int:
+    if args.interval <= 0 or args.duration < 0:
+        raise ValueError("interval 必须大于 0，duration 不能小于 0")
+    detector = _detector(args.model, args.threshold)
+    tracker = WindowsFlowTracker()
+    started = time.monotonic()
+    written = observed = 0
+    print("Windows 实时监控已启动；按 Ctrl+C 停止。")
+    with Path(args.output).open("w", encoding="utf-8") as handle:
+        try:
+            while True:
+                observations = tracker.observe(collect_connections(), time.time())
+                for observation in observations:
+                    observed += 1
+                    result = detector.analyze(observation.flow)
+                    process = f"{observation.process_name}({observation.process_id})"
+                    print(f"[{observation.direction:8}] process={process:24} state={observation.state:12}", end=" ")
+                    _print_result(result)
+                    if args.all or result.is_alert:
+                        payload = result.to_dict() | {
+                            "process_id": observation.process_id,
+                            "process_name": observation.process_name,
+                            "connection_state": observation.state,
+                            "direction": observation.direction,
+                        }
+                        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                        handle.flush()
+                        written += 1
+                if args.once or (args.duration and time.monotonic() - started >= args.duration):
+                    break
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\n已停止监控。")
+    print(f"共观察 {observed} 条新连接，写入 {written} 条记录到 {args.output}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Windows terminals may inherit a legacy encoding. Keep Chinese explanations
     # readable and prevent one unsupported character from aborting analysis.
@@ -128,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
         "analyze": run_analyze,
         "train": run_train,
         "evaluate": run_evaluate,
+        "pcap": run_pcap,
+        "monitor": run_monitor,
     }
     try:
         return actions[args.command](args)
