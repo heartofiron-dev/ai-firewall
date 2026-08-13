@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.2 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测与研究，不是生产级防火墙。** v0.3 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
 
 ## 已经完成了什么
 
@@ -18,6 +18,9 @@
 - 所有分析默认在本机完成，不上传网络记录。
 - 支持直接读取 classic PCAP，将 Ethernet、RAW 或 Linux SLL 中的 IPv4/IPv6 TCP/UDP 包聚合成网络流。
 - 支持 Windows 实时 TCP 连接监控，展示进程、PID、连接方向、状态、风险和告警原因。
+- 支持 PCAPNG Section、Interface 与 Enhanced Packet Block，可读取多接口及各自时间分辨率。
+- 默认把正反方向数据包合并为一条双向流，分别统计 `bytes_sent` 与 `bytes_received`。
+- 支持使用 Windows 自带 `pktmon` 进行 1～3600 秒的限时包级采集，并转换为本地 PCAPNG。
 
 ## 系统如何工作
 
@@ -35,7 +38,7 @@ flowchart LR
     I --> J[未来：防火墙策略]
 ```
 
-当前仓库已经实现图中的 classic PCAP、网络流聚合、Windows 连接采集、CSV、特征、模型、规则、评分、提示和 JSONL 输出。PCAPNG、更底层的 Windows 包/字节统计与防火墙策略属于后续阶段。
+当前仓库已经实现图中的 classic PCAP/PCAPNG、双向网络流聚合、Windows 连接与包级采集、CSV、特征、模型、规则、评分、提示和 JSONL 输出。IPv6 扩展头、长期后台服务、图形界面与防火墙策略属于后续阶段。
 
 ## 当前能识别的行为
 
@@ -83,22 +86,24 @@ ai-firewall demo
 只做格式转换：
 
 ```bash
-ai-firewall pcap capture.pcap --output flows.csv
+ai-firewall pcap capture.pcapng --output flows.csv
 ```
 
 转换后立即检测并输出告警：
 
 ```bash
-ai-firewall pcap capture.pcap --output flows.csv --analyze --alerts pcap-alerts.jsonl
+ai-firewall pcap capture.pcapng --output flows.csv --analyze --alerts pcap-alerts.jsonl
 ```
 
 当前转换器具有以下边界：
 
-- 支持 classic PCAP，暂不支持 PCAPNG；
+- 自动识别 classic PCAP 与 PCAPNG；
+- PCAPNG 支持多个 Section、Interface、Enhanced Packet Block 和接口时间分辨率；
 - 支持 Ethernet、RAW IP、Linux cooked capture v1；
 - 支持 IPv4 TCP/UDP，以及不带扩展头的 IPv6 TCP/UDP；
 - 只使用包头和长度，不保存应用层载荷；
-- 按方向性五元组聚合；双向字节配对将在后续版本加入。
+- 默认按双向五元组聚合，以捕获到的第一个包作为发起方向并分别统计上下行字节；
+- 如需保留原始方向性流，可添加 `--directional`。
 
 只应分析你有权查看的抓包文件。真实 PCAP 仍可能包含 IP、域名和其他敏感信息，禁止直接提交到公开仓库。
 
@@ -125,6 +130,31 @@ ai-firewall monitor --duration 0
 实时监控优先通过 Windows 自带的 `Get-NetTCPConnection` 获取本机 TCP 元数据；如果当前会话无权调用它，会自动回退到只读的 `netstat -ano`。程序在系统允许时使用进程列表补充名称和 PID，通常不需要管理员权限。它只会把“本轮新出现”的连接计入按来源 IP、进程和方向隔离的 60 秒窗口，避免长连接重复计数，也避免不同桌面程序共同触发端口扫描误报。
 
 连接表不包含完整包数和字节数，也可能错过非常短的连接，所以实时模式目前适合发现连接突增、可疑端口和进程外联，不应声称可以替代包级 IDS。需要包级分析时使用 PCAP 路线。
+
+### 0.2 Windows 限时包级采集
+
+在“以管理员身份运行”的 PowerShell 中执行：
+
+```powershell
+ai-firewall capture --duration 30 --output capture.pcapng
+```
+
+采集结束后立即聚合并检测：
+
+```powershell
+ai-firewall capture --duration 30 --output capture.pcapng --analyze
+```
+
+安全设计：
+
+- 使用 Windows 自带 `pktmon`，不安装内核驱动或第三方抓包程序；
+- 必须指定 1～3600 秒范围内的时长，默认 30 秒；
+- 输出必须是 `.pcapng`，已存在的文件默认拒绝覆盖；
+- 只有显式添加 `--overwrite` 才允许覆盖同名输出；
+- 中断时仍会停止本次采集，并清理中间 ETL 文件；
+- 数据只保存在指定本地路径，不会被程序上传。
+
+PCAPNG 可能包含敏感 IP、DNS 和未加密应用数据。只在获授权的设备和网络上使用，采集后按敏感数据管理，不要提交到公开 GitHub 仓库。
 
 ### 1. 分析网络流文件
 
@@ -212,6 +242,9 @@ python -m unittest discover -s tests -v
 - 训练结果能保存、重新加载并给出 0～1 概率。
 - 合成 classic PCAP 能正确解析 TCP 五元组并计算 60 秒上下文；损坏文件会被拒绝。
 - Windows PowerShell JSON 能转换为连接对象，入站/出站方向推断和长连接去重有效。
+- PCAPNG 的 Section、Interface、微秒时间分辨率与 Enhanced Packet Block 能正确解析。
+- TCP 正反方向数据包能合并，并分别累计上下行字节；`--directional` 仍可保留两条流。
+- Windows 包级采集会拒绝无限时长、错误扩展名和意外覆盖，并生成明确的 `pktmon` 命令。
 
 ### 手工验收清单
 
@@ -247,6 +280,7 @@ ai-firewall/
 │   ├── rules.py                # 可解释安全规则
 │   ├── schema.py               # 网络流数据结构
 │   ├── training.py             # 逻辑回归训练器
+│   ├── windows_capture.py      # pktmon 限时采集、ETL 转 PCAPNG
 │   └── windows_monitor.py      # Windows 连接、进程和滚动窗口监控
 ├── tests/                      # 自动化测试
 ├── .github/workflows/tests.yml # GitHub Actions
@@ -276,8 +310,9 @@ ai-firewall/
 | P0 | 降低误报基线 | 在独立测试集报告每日误报与 FPR | 待办 |
 | P1 | PCAP 转换器 | 可将授权的 classic PCAP 聚合成本项目 CSV，不保存载荷 | ✅ v0.2 |
 | P1 | Windows 实时采集 | 低权限优先；展示进程、目的地和连接统计 | ✅ v0.2 基础版 |
-| P1 | PCAPNG 与双向流 | 支持 PCAPNG、IPv6 扩展头与双向字节统计 | 待办 |
-| P1 | Windows 包级采集 | 补充包数、字节、短连接与稳定方向判断 | 待办 |
+| P1 | PCAPNG 与双向流 | 支持多接口 PCAPNG 与双向字节统计 | ✅ v0.3 |
+| P1 | Windows 包级采集 | 使用 pktmon 限时采集、转 PCAPNG 并可直接检测 | ✅ v0.3 |
+| P1 | IPv6 扩展头 | 安全遍历常见扩展头并限制解析深度 | 待办 |
 | P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | 待办 |
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | 待办 |
 | P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | 部分完成 |
