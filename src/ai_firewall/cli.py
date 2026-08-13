@@ -9,9 +9,10 @@ from pathlib import Path
 from .detector import HybridDetector
 from .io import read_flows, write_flows_csv, write_jsonl
 from .model import LinearModel
-from .pcap import read_pcap
+from .pcap import read_capture
 from .training import label_to_int, save_model, train_logistic_model
 from .windows_monitor import WindowsFlowTracker, collect_connections
+from .windows_capture import capture_with_pktmon
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--model", default=str(DEFAULT_MODEL))
     evaluate.add_argument("--threshold", type=float, default=0.60)
 
-    pcap = sub.add_parser("pcap", help="将 classic PCAP 转换为网络流 CSV")
+    pcap = sub.add_parser("pcap", help="将 classic PCAP 或 PCAPNG 转换为网络流 CSV")
     pcap.add_argument("input")
     pcap.add_argument("--output", default="flows.csv")
     pcap.add_argument("--max-packets", type=int)
@@ -56,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     pcap.add_argument("--alerts", default="pcap-alerts.jsonl")
     pcap.add_argument("--model", default=str(DEFAULT_MODEL))
     pcap.add_argument("--threshold", type=float, default=0.60)
+    pcap.add_argument("--directional", action="store_true", help="不合并反向数据包")
 
     monitor = sub.add_parser("monitor", help="实时监控 Windows TCP 连接")
     monitor.add_argument("--interval", type=float, default=2.0)
@@ -65,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--all", action="store_true", help="写入全部新连接，而不仅是告警")
     monitor.add_argument("--model", default=str(DEFAULT_MODEL))
     monitor.add_argument("--threshold", type=float, default=0.60)
+
+    capture = sub.add_parser("capture", help="使用 Windows pktmon 进行限时包级采集")
+    capture.add_argument("--duration", type=float, default=30.0)
+    capture.add_argument("--output", default="capture.pcapng")
+    capture.add_argument("--overwrite", action="store_true")
+    capture.add_argument("--analyze", action="store_true", help="采集完成后立即检测")
+    capture.add_argument("--flows", default="captured-flows.csv")
+    capture.add_argument("--alerts", default="capture-alerts.jsonl")
+    capture.add_argument("--model", default=str(DEFAULT_MODEL))
+    capture.add_argument("--threshold", type=float, default=0.60)
     return parser
 
 
@@ -137,7 +149,9 @@ def run_evaluate(args: argparse.Namespace) -> int:
 
 
 def run_pcap(args: argparse.Namespace) -> int:
-    flows = read_pcap(args.input, max_packets=args.max_packets)
+    flows = read_capture(
+        args.input, max_packets=args.max_packets, bidirectional=not args.directional,
+    )
     write_flows_csv(flows, args.output)
     print(f"已从 PCAP 聚合 {len(flows)} 条网络流，写入 {args.output}")
     if args.analyze:
@@ -148,6 +162,21 @@ def run_pcap(args: argparse.Namespace) -> int:
         for result in results:
             _print_result(result)
         print(f"产生 {len(alerts)} 条告警，写入 {args.alerts}")
+    return 0
+
+
+def run_capture(args: argparse.Namespace) -> int:
+    print(f"将在本机采集 {args.duration:g} 秒，输出到 {args.output}；不会上传数据。")
+    capture_path = capture_with_pktmon(args.duration, args.output, overwrite=args.overwrite)
+    print(f"包级采集完成: {capture_path}")
+    if args.analyze:
+        flows = read_capture(capture_path)
+        write_flows_csv(flows, args.flows)
+        detector = _detector(args.model, args.threshold)
+        results = [detector.analyze(flow) for flow in flows]
+        alerts = [result for result in results if result.is_alert]
+        write_jsonl(alerts, args.alerts)
+        print(f"聚合 {len(flows)} 条双向流，产生 {len(alerts)} 条告警。")
     return 0
 
 
@@ -203,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         "evaluate": run_evaluate,
         "pcap": run_pcap,
         "monitor": run_monitor,
+        "capture": run_capture,
     }
     try:
         return actions[args.command](args)
