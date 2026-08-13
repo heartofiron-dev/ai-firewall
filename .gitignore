@@ -10,4 +10,8 @@ alerts.jsonl
 *-alerts.jsonl
 current-connections.jsonl
 flows.csv
+captured-flows.csv
+*.pcap
+*.pcapng
+*.etl
 models/trained-*.json
