@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.3 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测与研究，不是生产级防火墙。** v0.4 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
 
 ## 已经完成了什么
 
@@ -21,6 +21,7 @@
 - 支持 PCAPNG Section、Interface 与 Enhanced Packet Block，可读取多接口及各自时间分辨率。
 - 默认把正反方向数据包合并为一条双向流，分别统计 `bytes_sent` 与 `bytes_received`。
 - 支持使用 Windows 自带 `pktmon` 进行 1～3600 秒的限时包级采集，并转换为本地 PCAPNG。
+- 支持按时间切分校准集与独立测试集，校准目标误报率，并输出逐日误报基线报告。
 
 ## 系统如何工作
 
@@ -205,6 +206,29 @@ ai-firewall evaluate data/sample_flows.csv --model models/baseline.json
 
 示例数据只用于验证程序流程，不能证明模型在真实网络上的效果。正式结论必须使用独立测试集，并按设备、网络环境和时间进行划分，避免数据泄漏。
 
+### 4. 建立误报基线
+
+对一份按时间持续收集、已经完成脱敏和标签审核的 CSV 运行：
+
+```bash
+ai-firewall benchmark labeled-flows.csv \
+  --calibration-fraction 0.4 \
+  --target-fpr 0.01 \
+  --output benchmark-report.json
+```
+
+该命令不会随机打乱数据。最早的 40% 记录只用于选择满足目标 FPR 的阈值，后续 60% 作为独立测试时间段，报告：
+
+- 校准阈值及目标是否达到；
+- 独立测试集 Precision、Recall、FPR 与混淆矩阵；
+- 平均每日误报数量；
+- 每个 UTC 日期的正常/攻击样本数、误报数和当日 FPR；
+- 数据过少或目标无法满足时的明确警告。
+
+至少需要 8 条记录；校准期必须包含正常样本，独立测试期必须同时包含正常和攻击样本。少于 1000 条测试记录或 1000 条正常测试记录时，报告会标记置信度不足。建议真实发布门槛至少使用跨多个工作日、从未参与训练的数据。
+
+不要使用 `data/sample_flows.csv` 宣称真实性能：它是程序演示集，规模不足，`benchmark` 会拒绝它。
+
 ## CSV 数据格式
 
 | 字段 | 类型 | 含义 |
@@ -245,6 +269,7 @@ python -m unittest discover -s tests -v
 - PCAPNG 的 Section、Interface、微秒时间分辨率与 Enhanced Packet Block 能正确解析。
 - TCP 正反方向数据包能合并，并分别累计上下行字节；`--directional` 仍可保留两条流。
 - Windows 包级采集会拒绝无限时长、错误扩展名和意外覆盖，并生成明确的 `pktmon` 命令。
+- 误报基线会按时间切分，输出逐日 FPR，并拒绝过小或类别缺失的独立测试区间。
 
 ### 手工验收清单
 
@@ -272,6 +297,7 @@ ai-firewall/
 ├── models/baseline.json        # 开发用启动模型
 ├── src/ai_firewall/
 │   ├── cli.py                  # demo/analyze/train/evaluate 命令
+│   ├── benchmark.py            # 时间切分、阈值校准与逐日误报报告
 │   ├── detector.py             # 混合评分与告警结果
 │   ├── features.py             # 特征提取
 │   ├── io.py                   # CSV 与 JSONL 输入输出
@@ -307,7 +333,8 @@ ai-firewall/
 |---|---|---|---|
 | P0 | 完成离线检测闭环 | CSV → 特征 → 模型/规则 → JSONL 告警 | ✅ v0.1 |
 | P0 | 建立自动化测试 | Python 3.10/3.12 在 GitHub Actions 通过 | ✅ v0.1 |
-| P0 | 降低误报基线 | 在独立测试集报告每日误报与 FPR | 待办 |
+| P0 | 误报基线工具 | 时间切分、阈值校准、独立测试集每日误报与 FPR 报告 | ✅ v0.4 |
+| P0 | 真实环境误报基线 | 在获授权且脱敏的跨日独立数据上达到发布门槛 | 待数据 |
 | P1 | PCAP 转换器 | 可将授权的 classic PCAP 聚合成本项目 CSV，不保存载荷 | ✅ v0.2 |
 | P1 | Windows 实时采集 | 低权限优先；展示进程、目的地和连接统计 | ✅ v0.2 基础版 |
 | P1 | PCAPNG 与双向流 | 支持多接口 PCAPNG 与双向字节统计 | ✅ v0.3 |
