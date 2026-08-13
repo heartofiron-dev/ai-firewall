@@ -13,6 +13,7 @@ from .pcap import read_capture
 from .training import label_to_int, save_model, train_logistic_model
 from .windows_monitor import WindowsFlowTracker, collect_connections
 from .windows_capture import capture_with_pktmon
+from .benchmark import build_benchmark_report, write_benchmark_report
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -77,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--alerts", default="capture-alerts.jsonl")
     capture.add_argument("--model", default=str(DEFAULT_MODEL))
     capture.add_argument("--threshold", type=float, default=0.60)
+
+    benchmark = sub.add_parser("benchmark", help="按时间切分并建立独立误报基线")
+    benchmark.add_argument("input", help="带标签和 ISO 8601 时间戳的 CSV")
+    benchmark.add_argument("--model", default=str(DEFAULT_MODEL))
+    benchmark.add_argument("--calibration-fraction", type=float, default=0.4)
+    benchmark.add_argument("--target-fpr", type=float, default=0.01)
+    benchmark.add_argument("--output", default="benchmark-report.json")
     return parser
 
 
@@ -180,6 +188,31 @@ def run_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_benchmark(args: argparse.Namespace) -> int:
+    flows = read_flows(args.input)
+    model = LinearModel.load(args.model)
+    report = build_benchmark_report(
+        model,
+        flows,
+        calibration_fraction=args.calibration_fraction,
+        target_fpr=args.target_fpr,
+        source=str(Path(args.input)),
+    )
+    write_benchmark_report(report, args.output)
+    summary = {
+        "threshold": report["calibration"]["threshold"],
+        "test_rows": report["independent_test"]["rows"],
+        "precision": report["independent_test"]["precision"],
+        "recall": report["independent_test"]["recall"],
+        "false_positive_rate": report["independent_test"]["false_positive_rate"],
+        "false_positives_per_day": report["independent_test"]["false_positives_per_day"],
+        "warnings": report["warnings"],
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f"完整基线报告已写入 {args.output}")
+    return 0
+
+
 def run_monitor(args: argparse.Namespace) -> int:
     if args.interval <= 0 or args.duration < 0:
         raise ValueError("interval 必须大于 0，duration 不能小于 0")
@@ -233,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         "pcap": run_pcap,
         "monitor": run_monitor,
         "capture": run_capture,
+        "benchmark": run_benchmark,
     }
     try:
         return actions[args.command](args)
