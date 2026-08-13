@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.1 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测与研究，不是生产级防火墙。** v0.2 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
 
 ## 已经完成了什么
 
@@ -16,6 +16,8 @@
 - 实现 precision、recall、false positive rate 等评估指标。
 - 提供安全的模拟数据、自动化测试和 GitHub Actions 持续集成。
 - 所有分析默认在本机完成，不上传网络记录。
+- 支持直接读取 classic PCAP，将 Ethernet、RAW 或 Linux SLL 中的 IPv4/IPv6 TCP/UDP 包聚合成网络流。
+- 支持 Windows 实时 TCP 连接监控，展示进程、PID、连接方向、状态、风险和告警原因。
 
 ## 系统如何工作
 
@@ -33,7 +35,7 @@ flowchart LR
     I --> J[未来：防火墙策略]
 ```
 
-当前仓库已经实现图中的 CSV、特征、模型、规则、评分、提示和 JSONL 输出。PCAP/实时系统采集与防火墙策略属于下一阶段。
+当前仓库已经实现图中的 classic PCAP、网络流聚合、Windows 连接采集、CSV、特征、模型、规则、评分、提示和 JSONL 输出。PCAPNG、更底层的 Windows 包/字节统计与防火墙策略属于后续阶段。
 
 ## 当前能识别的行为
 
@@ -75,6 +77,54 @@ ai-firewall demo
 演示会分析 2 条正常样本和 4 条攻击模拟样本。它只读取仓库内的 CSV，不发送攻击流量，也不会修改系统配置。
 
 ## 功能使用方法
+
+### 0. 从 PCAP 转换并检测
+
+只做格式转换：
+
+```bash
+ai-firewall pcap capture.pcap --output flows.csv
+```
+
+转换后立即检测并输出告警：
+
+```bash
+ai-firewall pcap capture.pcap --output flows.csv --analyze --alerts pcap-alerts.jsonl
+```
+
+当前转换器具有以下边界：
+
+- 支持 classic PCAP，暂不支持 PCAPNG；
+- 支持 Ethernet、RAW IP、Linux cooked capture v1；
+- 支持 IPv4 TCP/UDP，以及不带扩展头的 IPv6 TCP/UDP；
+- 只使用包头和长度，不保存应用层载荷；
+- 按方向性五元组聚合；双向字节配对将在后续版本加入。
+
+只应分析你有权查看的抓包文件。真实 PCAP 仍可能包含 IP、域名和其他敏感信息，禁止直接提交到公开仓库。
+
+### 0.1 Windows 实时连接监控
+
+监控 60 秒：
+
+```powershell
+ai-firewall monitor --duration 60 --output live-alerts.jsonl
+```
+
+只采集一次当前连接，适合快速验收：
+
+```powershell
+ai-firewall monitor --once --all --output current-connections.jsonl
+```
+
+持续运行直到按下 `Ctrl+C`：
+
+```powershell
+ai-firewall monitor --duration 0
+```
+
+实时监控优先通过 Windows 自带的 `Get-NetTCPConnection` 获取本机 TCP 元数据；如果当前会话无权调用它，会自动回退到只读的 `netstat -ano`。程序在系统允许时使用进程列表补充名称和 PID，通常不需要管理员权限。它只会把“本轮新出现”的连接计入按来源 IP、进程和方向隔离的 60 秒窗口，避免长连接重复计数，也避免不同桌面程序共同触发端口扫描误报。
+
+连接表不包含完整包数和字节数，也可能错过非常短的连接，所以实时模式目前适合发现连接突增、可疑端口和进程外联，不应声称可以替代包级 IDS。需要包级分析时使用 PCAP 路线。
 
 ### 1. 分析网络流文件
 
@@ -160,6 +210,8 @@ python -m unittest discover -s tests -v
 - 连接洪泛会得到最高严重级别；
 - 异常大流量与可疑端口能同时留下证据；
 - 训练结果能保存、重新加载并给出 0～1 概率。
+- 合成 classic PCAP 能正确解析 TCP 五元组并计算 60 秒上下文；损坏文件会被拒绝。
+- Windows PowerShell JSON 能转换为连接对象，入站/出站方向推断和长连接去重有效。
 
 ### 手工验收清单
 
@@ -191,9 +243,11 @@ ai-firewall/
 │   ├── features.py             # 特征提取
 │   ├── io.py                   # CSV 与 JSONL 输入输出
 │   ├── model.py                # 模型加载和推理
+│   ├── pcap.py                 # 纯 Python classic PCAP 解析与流聚合
 │   ├── rules.py                # 可解释安全规则
 │   ├── schema.py               # 网络流数据结构
-│   └── training.py             # 逻辑回归训练器
+│   ├── training.py             # 逻辑回归训练器
+│   └── windows_monitor.py      # Windows 连接、进程和滚动窗口监控
 ├── tests/                      # 自动化测试
 ├── .github/workflows/tests.yml # GitHub Actions
 ├── SECURITY.md                 # 安全与漏洞报告说明
@@ -220,8 +274,10 @@ ai-firewall/
 | P0 | 完成离线检测闭环 | CSV → 特征 → 模型/规则 → JSONL 告警 | ✅ v0.1 |
 | P0 | 建立自动化测试 | Python 3.10/3.12 在 GitHub Actions 通过 | ✅ v0.1 |
 | P0 | 降低误报基线 | 在独立测试集报告每日误报与 FPR | 待办 |
-| P1 | PCAP 转换器 | 可将授权的 PCAP 聚合成本项目 CSV，不保存载荷 | 待办 |
-| P1 | Windows 实时采集 | 低权限优先；展示进程、目的地和连接统计 | 待办 |
+| P1 | PCAP 转换器 | 可将授权的 classic PCAP 聚合成本项目 CSV，不保存载荷 | ✅ v0.2 |
+| P1 | Windows 实时采集 | 低权限优先；展示进程、目的地和连接统计 | ✅ v0.2 基础版 |
+| P1 | PCAPNG 与双向流 | 支持 PCAPNG、IPv6 扩展头与双向字节统计 | 待办 |
+| P1 | Windows 包级采集 | 补充包数、字节、短连接与稳定方向判断 | 待办 |
 | P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | 待办 |
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | 待办 |
 | P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | 部分完成 |
