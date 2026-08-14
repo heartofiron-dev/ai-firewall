@@ -23,6 +23,26 @@ def ethernet_ipv4_tcp(
     return ethernet + ip_header + tcp_header
 
 
+def ethernet_ipv6(next_header: int, payload: bytes) -> bytes:
+    ethernet = bytes.fromhex("00112233445566778899aabb86dd")
+    src = bytes.fromhex("20010db8000000000000000000000001")
+    dst = bytes.fromhex("20010db8000000000000000000000002")
+    ipv6_header = struct.pack(
+        "!IHBB16s16s", 6 << 28, len(payload), next_header, 64, src, dst
+    )
+    return ethernet + ipv6_header + payload
+
+
+def tcp_header(src_port: int = 50000, dst_port: int = 443) -> bytes:
+    return struct.pack(
+        "!HHLLBBHHH", src_port, dst_port, 0, 0, 5 << 4, 0x02, 1024, 0, 0
+    )
+
+
+def udp_header(src_port: int = 53000, dst_port: int = 53) -> bytes:
+    return struct.pack("!HHHH", src_port, dst_port, 8, 0)
+
+
 def classic_pcap(frames: list[bytes]) -> bytes:
     data = bytearray(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
     for index, frame in enumerate(frames):
@@ -106,7 +126,65 @@ class PcapTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "classic PCAP"):
                 read_capture(path)
 
+    def _read_ipv6_frame(self, frame: bytes):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ipv6.pcap"
+            path.write_bytes(classic_pcap([frame]))
+            return read_pcap(path)
+
+    def test_ipv6_walks_hop_by_hop_and_destination_headers(self):
+        hop_by_hop = bytes([60, 0]) + bytes(6)
+        destination = bytes([6, 0]) + bytes(6)
+        flows = self._read_ipv6_frame(
+            ethernet_ipv6(0, hop_by_hop + destination + tcp_header())
+        )
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0].src_ip, "2001:db8::1")
+        self.assertEqual(flows[0].dst_port, 443)
+        self.assertEqual(flows[0].protocol, "TCP")
+
+    def test_ipv6_walks_routing_and_authentication_headers(self):
+        routing = bytes([51, 0]) + bytes(6)
+        authentication = bytes([17, 1]) + bytes(10)
+        flows = self._read_ipv6_frame(
+            ethernet_ipv6(43, routing + authentication + udp_header())
+        )
+        self.assertEqual(len(flows), 1)
+        self.assertEqual(flows[0].dst_port, 53)
+        self.assertEqual(flows[0].protocol, "UDP")
+
+    def test_ipv6_accepts_first_fragment_and_skips_non_first_fragment(self):
+        first_fragment = struct.pack("!BBHI", 6, 0, 1, 123)
+        later_fragment = struct.pack("!BBHI", 6, 0, 8, 123)
+        self.assertEqual(
+            len(self._read_ipv6_frame(ethernet_ipv6(44, first_fragment + tcp_header()))),
+            1,
+        )
+        self.assertEqual(
+            self._read_ipv6_frame(ethernet_ipv6(44, later_fragment + bytes(20))),
+            [],
+        )
+
+    def test_ipv6_rejects_truncated_and_overdeep_extension_chains(self):
+        truncated = bytes([6, 1]) + bytes(6)
+        self.assertEqual(
+            self._read_ipv6_frame(ethernet_ipv6(60, truncated)),
+            [],
+        )
+
+        headers = b"".join(
+            bytes([60 if index < 8 else 6, 0]) + bytes(6)
+            for index in range(9)
+        )
+        self.assertEqual(
+            self._read_ipv6_frame(ethernet_ipv6(60, headers + tcp_header())),
+            [],
+        )
+
+    def test_ipv6_skips_esp_and_no_next_header(self):
+        self.assertEqual(self._read_ipv6_frame(ethernet_ipv6(50, bytes(24))), [])
+        self.assertEqual(self._read_ipv6_frame(ethernet_ipv6(59, b"")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
-
