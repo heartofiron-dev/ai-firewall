@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.4 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测与研究，不是生产级防火墙。** v0.5 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
 
 ## 已经完成了什么
 
@@ -22,6 +22,7 @@
 - 默认把正反方向数据包合并为一条双向流，分别统计 `bytes_sent` 与 `bytes_received`。
 - 支持使用 Windows 自带 `pktmon` 进行 1～3600 秒的限时包级采集，并转换为本地 PCAPNG。
 - 支持按时间切分校准集与独立测试集，校准目标误报率，并输出逐日误报基线报告。
+- 支持安全遍历常见 IPv6 扩展头，并对扩展头数量、累计长度、分片和畸形包执行严格边界检查。
 
 ## 系统如何工作
 
@@ -39,7 +40,7 @@ flowchart LR
     I --> J[未来：防火墙策略]
 ```
 
-当前仓库已经实现图中的 classic PCAP/PCAPNG、双向网络流聚合、Windows 连接与包级采集、CSV、特征、模型、规则、评分、提示和 JSONL 输出。IPv6 扩展头、长期后台服务、图形界面与防火墙策略属于后续阶段。
+当前仓库已经实现图中的 classic PCAP/PCAPNG、IPv6 扩展头、双向网络流聚合、Windows 连接与包级采集、CSV、特征、模型、规则、评分、提示和 JSONL 输出。长期后台服务、图形界面与防火墙策略属于后续阶段。
 
 ## 当前能识别的行为
 
@@ -101,7 +102,8 @@ ai-firewall pcap capture.pcapng --output flows.csv --analyze --alerts pcap-alert
 - 自动识别 classic PCAP 与 PCAPNG；
 - PCAPNG 支持多个 Section、Interface、Enhanced Packet Block 和接口时间分辨率；
 - 支持 Ethernet、RAW IP、Linux cooked capture v1；
-- 支持 IPv4 TCP/UDP，以及不带扩展头的 IPv6 TCP/UDP；
+- 支持 IPv4 TCP/UDP，以及带 Hop-by-Hop、Routing、Destination、Fragment、AH、Mobility 常见扩展头的 IPv6 TCP/UDP；
+- IPv6 扩展头最多遍历 8 个、累计 2048 字节；非首片分片、ESP、无下一头、异常顺序和畸形长度会被安全跳过；
 - 只使用包头和长度，不保存应用层载荷；
 - 默认按双向五元组聚合，以捕获到的第一个包作为发起方向并分别统计上下行字节；
 - 如需保留原始方向性流，可添加 `--directional`。
@@ -270,6 +272,7 @@ python -m unittest discover -s tests -v
 - TCP 正反方向数据包能合并，并分别累计上下行字节；`--directional` 仍可保留两条流。
 - Windows 包级采集会拒绝无限时长、错误扩展名和意外覆盖，并生成明确的 `pktmon` 命令。
 - 误报基线会按时间切分，输出逐日 FPR，并拒绝过小或类别缺失的独立测试区间。
+- IPv6 常见扩展头链和首片分片可正确定位 TCP/UDP；非首片、ESP、无下一头、截断与超深链会被安全跳过。
 
 ### 手工验收清单
 
@@ -339,7 +342,7 @@ ai-firewall/
 | P1 | Windows 实时采集 | 低权限优先；展示进程、目的地和连接统计 | ✅ v0.2 基础版 |
 | P1 | PCAPNG 与双向流 | 支持多接口 PCAPNG 与双向字节统计 | ✅ v0.3 |
 | P1 | Windows 包级采集 | 使用 pktmon 限时采集、转 PCAPNG 并可直接检测 | ✅ v0.3 |
-| P1 | IPv6 扩展头 | 安全遍历常见扩展头并限制解析深度 | 待办 |
+| P1 | IPv6 扩展头 | 安全遍历常见扩展头并限制解析深度 | ✅ v0.5 |
 | P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | 待办 |
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | 待办 |
 | P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | 部分完成 |
