@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.5 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测与研究，不是生产级防火墙。** v0.6 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
 
 ## 已经完成了什么
 
@@ -23,6 +23,7 @@
 - 支持使用 Windows 自带 `pktmon` 进行 1～3600 秒的限时包级采集，并转换为本地 PCAPNG。
 - 支持按时间切分校准集与独立测试集，校准目标误报率，并输出逐日误报基线报告。
 - 支持安全遍历常见 IPv6 扩展头，并对扩展头数量、累计长度、分片和畸形包执行严格边界检查。
+- 提供 CICIDS2017 与 UNSW-NB15 的独立 CSV 适配器，统一字段、时间单位、标签和 60 秒上下文。
 
 ## 系统如何工作
 
@@ -40,7 +41,7 @@ flowchart LR
     I --> J[未来：防火墙策略]
 ```
 
-当前仓库已经实现图中的 classic PCAP/PCAPNG、IPv6 扩展头、双向网络流聚合、Windows 连接与包级采集、CSV、特征、模型、规则、评分、提示和 JSONL 输出。长期后台服务、图形界面与防火墙策略属于后续阶段。
+当前仓库已经实现图中的 classic PCAP/PCAPNG、IPv6 扩展头、双向网络流聚合、Windows 连接与包级采集、公开数据集适配、CSV、特征、模型、规则、评分、提示和 JSONL 输出。长期后台服务、图形界面与防火墙策略属于后续阶段。
 
 ## 当前能识别的行为
 
@@ -159,6 +160,47 @@ ai-firewall capture --duration 30 --output capture.pcapng --analyze
 
 PCAPNG 可能包含敏感 IP、DNS 和未加密应用数据。只在获授权的设备和网络上使用，采集后按敏感数据管理，不要提交到公开 GitHub 仓库。
 
+### 0.3 转换 CICIDS2017 / UNSW-NB15
+
+本项目不自动下载公开数据集。请先确认数据集许可，并从官方来源取得 CSV：
+
+- [CICIDS2017（University of New Brunswick）](https://www.unb.ca/cic/datasets/ids-2017.html)
+- [UNSW-NB15（UNSW Canberra）](https://research.unsw.edu.au/projects/unsw-nb15-dataset)
+
+转换 CICIDS2017 的 CICFlowMeter CSV：
+
+```bash
+ai-firewall convert-dataset cicids2017 CICIDS2017.csv \
+  --timestamp-format "%m/%d/%Y %H:%M:%S" \
+  --output cicids-flows.csv
+```
+
+转换 UNSW-NB15 官方 49 字段原始流 CSV（支持官方无表头文件，也支持同字段带表头文件）：
+
+```bash
+ai-firewall convert-dataset unsw-nb15 UNSW-NB15.csv --output unsw-flows.csv
+```
+
+先安全试跑前 1000 行：
+
+```bash
+ai-firewall convert-dataset cicids2017 CICIDS2017.csv \
+  --max-rows 1000 --output preview.csv
+```
+
+转换规则与边界：
+
+- CICIDS2017 的 `Flow Duration` 从微秒转换为毫秒，正反向包数与字节数映射到统一 schema；`BENIGN` 转为 `benign`，其他攻击名称转为 `attack`。
+- CICIDS 的斜线日期可能有月/日歧义。正式实验应显式传入 Python `strptime` 格式；未指定时优先按月/日解析。
+- UNSW-NB15 的 `stime` 按 Unix 秒转换为 UTC ISO 8601，`dur` 从秒转换为毫秒，并支持十六进制端口。
+- UNSW 官方 49 字段原始分片可直接转换；带表头版本必须提供 `srcip`、`dstip`、`sport`、`dsport`、`stime`。官方 training/testing 分区省略了端点和 `stime`，无法可靠生成本项目五元组与时间窗口，因此会被有意拒绝。
+- 两个适配器都按来源 IP 计算当前记录在内的 60 秒连接数、目标端口数和失败连接数；输入必须在每个来源内按时间非递减排列，否则拒绝转换，防止上下文泄漏。
+- 缺少必需字段、无效 IP/端口、负数、`NaN`、`Infinity` 会明确报错；UNSW 没有等价 TCP flag 计数时不伪造 SYN，只有明确 `RST` 状态计入 RST。
+- 转换以流式方式运行，不把完整数据集载入内存；先写临时文件，成功后再替换目标。已有输出默认不会覆盖，只有显式添加 `--overwrite` 才会替换。
+- 转换器只读取 CSV 元数据，不读取 PCAP、不发包、不扫描网络，也不会上传数据。不要把完整公开数据集、真实日志或包含个人网络标识的转换结果提交到本仓库。
+
+公开数据集只能验证适配和模型研究流程，不能替代目标电脑上经过授权、匿名化且跨日的正常流量基线。
+
 ### 1. 分析网络流文件
 
 ```bash
@@ -273,6 +315,7 @@ python -m unittest discover -s tests -v
 - Windows 包级采集会拒绝无限时长、错误扩展名和意外覆盖，并生成明确的 `pktmon` 命令。
 - 误报基线会按时间切分，输出逐日 FPR，并拒绝过小或类别缺失的独立测试区间。
 - IPv6 常见扩展头链和首片分片可正确定位 TCP/UDP；非首片、ESP、无下一头、截断与超深链会被安全跳过。
+- CICIDS2017 与 UNSW-NB15 合成字段能转换并重新读取；单位、标签、十六进制端口和 60 秒上下文正确，缺字段、非有限数值和时间倒退会被拒绝。
 
 ### 手工验收清单
 
@@ -302,6 +345,7 @@ ai-firewall/
 │   ├── cli.py                  # demo/analyze/train/evaluate 命令
 │   ├── benchmark.py            # 时间切分、阈值校准与逐日误报报告
 │   ├── detector.py             # 混合评分与告警结果
+│   ├── datasets.py             # CICIDS2017 / UNSW-NB15 安全转换器
 │   ├── features.py             # 特征提取
 │   ├── io.py                   # CSV 与 JSONL 输入输出
 │   ├── model.py                # 模型加载和推理
@@ -322,7 +366,7 @@ ai-firewall/
 建议按下面的顺序引入数据，而不是直接混合所有公开数据集：
 
 1. 使用 `sample_flows.csv` 验证代码、格式和测试闭环。
-2. 编写 CICIDS2017 / CSE-CIC-IDS2018 / UNSW-NB15 的独立转换器，统一到本项目字段。
+2. 使用已实现的 CICIDS2017 / UNSW-NB15 独立转换器统一字段；CSE-CIC-IDS2018 需先验证版本字段差异。
 3. 在隔离实验室中生成少量、可复现且有明确授权的攻击样本。
 4. 收集经过匿名化的真实正常流量，建立不同设备类型和使用时段的基线。
 5. 保留从未参与训练的时间段与网络作为最终测试集。
@@ -343,7 +387,7 @@ ai-firewall/
 | P1 | PCAPNG 与双向流 | 支持多接口 PCAPNG 与双向字节统计 | ✅ v0.3 |
 | P1 | Windows 包级采集 | 使用 pktmon 限时采集、转 PCAPNG 并可直接检测 | ✅ v0.3 |
 | P1 | IPv6 扩展头 | 安全遍历常见扩展头并限制解析深度 | ✅ v0.5 |
-| P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | 待办 |
+| P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | ✅ v0.6 |
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | 待办 |
 | P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | 部分完成 |
 | P2 | 本地界面 | 查看实时连接、筛选告警、标记误报 | 待办 |
@@ -367,6 +411,7 @@ ai-firewall/
 - 仅在你拥有或明确获准测试的网络上采集与验证。
 - `baseline.json` 是开发启动模型，不代表已经过真实环境验证。
 - 不要把密码、Cookie、API key、原始私密流量或个人身份信息提交到仓库。
+- 不要提交完整公开数据集或其大规模派生文件；只提交许可清楚、不含个人信息的最小合成测试数据。
 - AI 结论必须经过规则、上下文和人工复核；当前版本不可作为唯一拦截依据。
 
 ## 贡献
