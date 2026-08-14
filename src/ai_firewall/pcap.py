@@ -18,6 +18,9 @@ CLASSIC_MAGIC = {
     b"\x4d\x3c\xb2\xa1": ("<", 1_000_000_000.0),
     b"\xa1\xb2\x3c\x4d": (">", 1_000_000_000.0),
 }
+IPV6_OPTION_EXTENSION_HEADERS = {0, 43, 60, 135}
+IPV6_MAX_EXTENSION_HEADERS = 8
+IPV6_MAX_EXTENSION_BYTES = 2048
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,60 @@ class _FlowAccumulator:
     rst_count: int = 0
 
 
+def _ipv6_transport(
+    packet: bytes, total_length: int, next_header: int,
+) -> tuple[int, bytes] | None:
+    """Return the TCP/UDP payload after a bounded IPv6 extension-header walk."""
+    offset = 40
+    header_count = 0
+    extension_bytes = 0
+    saw_fragment = False
+
+    while next_header not in {6, 17}:
+        if header_count >= IPV6_MAX_EXTENSION_HEADERS:
+            return None
+
+        header_length: int
+        if next_header in IPV6_OPTION_EXTENSION_HEADERS:
+            # Hop-by-Hop Options is only valid immediately after the IPv6 header.
+            if next_header == 0 and offset != 40:
+                return None
+            if offset + 2 > total_length:
+                return None
+            following_header = packet[offset]
+            header_length = (packet[offset + 1] + 1) * 8
+        elif next_header == 44:  # Fragment
+            if saw_fragment or offset + 8 > total_length:
+                return None
+            saw_fragment = True
+            following_header = packet[offset]
+            header_length = 8
+            fragment_field = struct.unpack("!H", packet[offset + 2:offset + 4])[0]
+            if fragment_field & 0xFFF8:  # Non-first fragments lack the transport header.
+                return None
+        elif next_header == 51:  # Authentication Header
+            if offset + 2 > total_length:
+                return None
+            following_header = packet[offset]
+            header_length = (packet[offset + 1] + 2) * 4
+            if header_length < 8:
+                return None
+        else:
+            # Includes ESP (50), No Next Header (59), and unsupported protocols.
+            return None
+
+        if offset + header_length > total_length:
+            return None
+        header_count += 1
+        extension_bytes += header_length
+        if extension_bytes > IPV6_MAX_EXTENSION_BYTES:
+            return None
+        offset += header_length
+        next_header = following_header
+
+    return next_header, packet[offset:total_length]
+
+
 def _transport_from_ip(packet: bytes) -> tuple[str, str, int, int, str, int, int, int] | None:
     if not packet:
         return None
@@ -65,13 +122,14 @@ def _transport_from_ip(packet: bytes) -> tuple[str, str, int, int, str, int, int
         if len(packet) < 40:
             return None
         protocol_number = packet[6]
-        if protocol_number not in {6, 17}:
-            return None
         payload_length = struct.unpack("!H", packet[4:6])[0]
         total_length = min(40 + payload_length, len(packet))
         src_ip = str(ipaddress.ip_address(packet[8:24]))
         dst_ip = str(ipaddress.ip_address(packet[24:40]))
-        transport = packet[40:total_length]
+        decoded_transport = _ipv6_transport(packet, total_length, protocol_number)
+        if decoded_transport is None:
+            return None
+        protocol_number, transport = decoded_transport
     else:
         return None
 
@@ -325,4 +383,3 @@ def read_capture(
     if magic in CLASSIC_MAGIC:
         return read_pcap(capture_path, max_packets=max_packets, bidirectional=bidirectional)
     raise ValueError("文件既不是受支持的 classic PCAP，也不是 PCAPNG")
-
