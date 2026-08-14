@@ -62,7 +62,8 @@ def write_jsonl(results: Iterable[DetectionResult], path: str | Path) -> None:
             handle.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
 
 
-def write_flows_csv(flows: Iterable[FlowRecord], path: str | Path) -> None:
+def write_flows_csv(flows: Iterable[FlowRecord], path: str | Path) -> int:
+    count = 0
     with Path(path).open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=FLOW_COLUMNS)
         writer.writeheader()
@@ -71,3 +72,5 @@ def write_flows_csv(flows: Iterable[FlowRecord], path: str | Path) -> None:
                 name: "" if getattr(flow, name) is None else getattr(flow, name)
                 for name in FLOW_COLUMNS
             })
+            count += 1
+    return count
