@@ -14,6 +14,7 @@ from .training import label_to_int, save_model, train_logistic_model
 from .windows_monitor import WindowsFlowTracker, collect_connections
 from .windows_capture import capture_with_pktmon
 from .benchmark import build_benchmark_report, write_benchmark_report
+from .datasets import iter_dataset
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -85,6 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--calibration-fraction", type=float, default=0.4)
     benchmark.add_argument("--target-fpr", type=float, default=0.01)
     benchmark.add_argument("--output", default="benchmark-report.json")
+
+    dataset = sub.add_parser("convert-dataset", help="将公开 IDS 数据集转换为统一网络流 CSV")
+    dataset.add_argument("format", choices=("cicids2017", "unsw-nb15"))
+    dataset.add_argument("input")
+    dataset.add_argument("--output", default="converted-flows.csv")
+    dataset.add_argument("--timestamp-format", help="CICIDS2017 日期格式，例如 %%d/%%m/%%Y %%H:%%M")
+    dataset.add_argument("--max-rows", type=int, help="只转换前 N 行，用于安全试跑")
+    dataset.add_argument("--overwrite", action="store_true", help="允许替换已存在的输出文件")
     return parser
 
 
@@ -213,6 +222,34 @@ def run_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_convert_dataset(args: argparse.Namespace) -> int:
+    input_path = Path(args.input).resolve()
+    output_path = Path(args.output).resolve()
+    if input_path == output_path:
+        raise ValueError("输出文件不能与输入数据集相同")
+    if output_path.exists() and not args.overwrite:
+        raise ValueError(f"输出文件已存在: {output_path}；如需替换请添加 --overwrite")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(output_path.name + ".tmp")
+    if temporary.exists():
+        raise ValueError(f"临时输出已存在，请先检查或移走: {temporary}")
+    try:
+        flows = iter_dataset(
+            args.format, input_path,
+            timestamp_format=args.timestamp_format,
+            max_rows=args.max_rows,
+        )
+        count = write_flows_csv(flows, temporary)
+        if output_path.exists() and not args.overwrite:
+            raise ValueError(f"输出文件已存在: {output_path}；转换结果未覆盖它")
+        temporary.replace(output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(f"已将 {args.format} 的 {count} 条记录转换到 {output_path}")
+    print("转换仅处理 CSV 元数据；未下载数据、未读取 PCAP、未发送任何网络流量。")
+    return 0
+
+
 def run_monitor(args: argparse.Namespace) -> int:
     if args.interval <= 0 or args.duration < 0:
         raise ValueError("interval 必须大于 0，duration 不能小于 0")
@@ -267,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         "monitor": run_monitor,
         "capture": run_capture,
         "benchmark": run_benchmark,
+        "convert-dataset": run_convert_dataset,
     }
     try:
         return actions[args.command](args)
