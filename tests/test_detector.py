@@ -23,6 +23,12 @@ class DetectorTests(unittest.TestCase):
         result = self.detector.analyze(self.flows[2])
         self.assertTrue(result.is_alert)
         self.assertIn("PORT_SCAN", result.rule_ids)
+        self.assertEqual(result.model_version, "0.1.0")
+        self.assertEqual(result.model_algorithm, "bootstrap_linear_risk_model")
+        self.assertEqual(result.rule_evidence[0]["rule_id"], "PORT_SCAN")
+        self.assertEqual(len(result.top_features), 3)
+        magnitudes = [abs(item["contribution"]) for item in result.top_features]
+        self.assertEqual(magnitudes, sorted(magnitudes, reverse=True))
 
     def test_brute_force_is_explained(self):
         result = self.detector.analyze(self.flows[3])
@@ -39,8 +45,29 @@ class DetectorTests(unittest.TestCase):
         self.assertTrue(result.is_alert)
         self.assertIn("DATA_SPIKE", result.rule_ids)
         self.assertIn("SUSPICIOUS_PORT", result.rule_ids)
+        self.assertEqual(
+            {item["rule_id"] for item in result.rule_evidence},
+            {"DATA_SPIKE", "SUSPICIOUS_PORT"},
+        )
+
+    def test_model_only_alert_still_has_structured_explanation(self):
+        baseline = self.detector.model
+        detector = HybridDetector(LinearModel(
+            feature_names=baseline.feature_names,
+            means=baseline.means,
+            scales=baseline.scales,
+            weights=baseline.weights,
+            bias=8.0,
+            metadata={"algorithm": "test_linear", "version": "test-1"},
+        ))
+        result = detector.analyze(self.flows[0])
+        payload = result.to_dict()
+        self.assertTrue(result.is_alert)
+        self.assertEqual(result.rule_evidence, [])
+        self.assertEqual(result.rule_ids, [])
+        self.assertEqual(payload["model_version"], "test-1")
+        self.assertEqual(len(payload["top_features"]), 3)
 
 
 if __name__ == "__main__":
     unittest.main()
-
