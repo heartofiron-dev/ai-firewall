@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.7 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测与研究，不是生产级防火墙。** v0.8 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
 
 ## 已经完成了什么
 
@@ -25,6 +25,7 @@
 - 支持安全遍历常见 IPv6 扩展头，并对扩展头数量、累计长度、分片和畸形包执行严格边界检查。
 - 提供 CICIDS2017 与 UNSW-NB15 的独立 CSV 适配器，统一字段、时间单位、标签和 60 秒上下文。
 - 支持在完全相同的时间切分、特征和误报目标下，对比逻辑回归、Isolation Forest 与 LightGBM。
+- 每条告警同时输出结构化规则证据、线性模型前三项特征贡献、算法和模型版本。
 
 ## 系统如何工作
 
@@ -42,7 +43,7 @@ flowchart LR
     I --> J[未来：防火墙策略]
 ```
 
-当前仓库已经实现图中的 classic PCAP/PCAPNG、IPv6 扩展头、双向网络流聚合、Windows 连接与包级采集、公开数据集适配、三模型公平对比、CSV、特征、模型、规则、评分、提示和 JSONL 输出。长期后台服务、图形界面与防火墙策略属于后续阶段。
+当前仓库已经实现图中的 classic PCAP/PCAPNG、IPv6 扩展头、双向网络流聚合、Windows 连接与包级采集、公开数据集适配、三模型公平对比、CSV、特征、模型、规则、评分、结构化解释、提示和 JSONL 输出。长期后台服务、图形界面与防火墙策略属于后续阶段。
 
 ## 当前能识别的行为
 
@@ -220,6 +221,17 @@ ai-firewall analyze data/sample_flows.csv --all --output all-results.jsonl
 ai-firewall analyze data/sample_flows.csv --threshold 0.70
 ```
 
+终端中的每条告警会额外显示 `model=算法@版本`、风险贡献绝对值最大的三个特征，以及命中的规则和规则分数。JSONL 保留原有字段，并新增：
+
+| 字段 | 含义 |
+|---|---|
+| `rule_evidence` | 每条命中规则的 `rule_id`、分数和文字证据 |
+| `top_features` | 特征原值、标准化值、权重、logit 贡献与风险方向 |
+| `model_algorithm` | 模型元数据中的算法名 |
+| `model_version` | 模型声明的版本；旧模型未声明时使用稳定的内容 SHA-256 短指纹 |
+
+`top_features` 是线性模型对本次评分的精确数学拆解，正贡献表示推高模型风险，负贡献表示降低模型风险。它用于审查模型判断，不代表因果关系，也不能单独证明攻击成立。
+
 ### 2. 训练自己的模型
 
 训练 CSV 必须包含 `label` 列；正常样本可写 `benign` 或 `0`，攻击样本可写 `attack` 或 `1`。
@@ -234,7 +246,7 @@ ai-firewall train data/sample_flows.csv --output models/trained-model.json
 ai-firewall analyze data/sample_flows.csv --model models/trained-model.json
 ```
 
-默认训练器仍是标准化后的二分类逻辑回归，使用随机梯度下降。它的优点是部署小、核心安装零依赖、输出稳定且容易解释。v0.7 的可选对比工具会训练 Isolation Forest 与 LightGBM 用于研究评估，但不会自动替换默认模型，更不会因为某次小样本排名而启用拦截。
+默认训练器仍是标准化后的二分类逻辑回归，使用随机梯度下降。它的优点是部署小、核心安装零依赖、输出稳定且容易解释。v0.7 起提供的可选对比工具会训练 Isolation Forest 与 LightGBM 用于研究评估，但不会自动替换默认模型，更不会因为某次小样本排名而启用拦截。
 
 ### 3. 评估检测效果
 
@@ -331,6 +343,7 @@ ai-firewall compare-models labeled-flows.csv \
 包含真实 Isolation Forest / LightGBM 集成测试时，先安装 `comparison` 依赖组：
 
 ```bash
+python -m pip install -e ".[comparison]"
 python -m unittest discover -s tests -v
 ```
 
@@ -351,12 +364,13 @@ python -m unittest discover -s tests -v
 - IPv6 常见扩展头链和首片分片可正确定位 TCP/UDP；非首片、ESP、无下一头、截断与超深链会被安全跳过。
 - CICIDS2017 与 UNSW-NB15 合成字段能转换并重新读取；单位、标签、十六进制端口和 60 秒上下文正确，缺字段、非有限数值和时间倒退会被拒绝。
 - 三模型共享同一训练/校准/测试时间边界和测试行数；真实 scikit-learn、LightGBM 适配器会完成训练、阈值校准和独立测试指标输出。
+- 规则证据与旧 `rule_ids` 一致；前三项模型贡献按绝对值排序，显式版本和旧模型内容指纹均可追踪。
 
 ### 手工验收清单
 
 1. 执行 `ai-firewall demo`，应看到 6 条分析结果，其中 2 条为 `OK`、4 条为 `ALERT`。
 2. 执行 `ai-firewall analyze data/sample_flows.csv`，确认生成 `alerts.jsonl`。
-3. 检查每条告警是否有 `risk_score`、`severity`、`reasons` 和 `rule_ids`。
+3. 检查每条告警是否有 `risk_score`、`severity`、`reasons`、`rule_evidence`、`top_features` 和 `model_version`。
 4. 执行训练命令，确认新模型 JSON 中包含训练时间、样本数和算法信息。
 5. 执行评估命令，确认 precision、recall 与误报率均有输出。
 6. 向 CSV 删除一个必需字段，程序应清楚提示缺少字段，而不是静默跳过。
@@ -425,7 +439,7 @@ ai-firewall/
 | P1 | IPv6 扩展头 | 安全遍历常见扩展头并限制解析深度 | ✅ v0.5 |
 | P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | ✅ v0.6 |
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | ✅ v0.7 |
-| P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | 部分完成 |
+| P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | ✅ v0.8 |
 | P2 | 本地界面 | 查看实时连接、筛选告警、标记误报 | 待办 |
 | P2 | 反馈学习 | 用户反馈进入隔离队列，经审核后再训练 | 待办 |
 | P2 | Windows 防火墙集成 | 默认关闭；允许名单、临时封禁、回滚和 kill switch 齐全 | 待办 |
@@ -449,6 +463,7 @@ ai-firewall/
 - 不要把密码、Cookie、API key、原始私密流量或个人身份信息提交到仓库。
 - 不要提交完整公开数据集或其大规模派生文件；只提交许可清楚、不含个人信息的最小合成测试数据。
 - 模型对比报告只反映给定时间切分；禁止把演示数据排名或单次高分解释为真实防护能力。
+- 特征贡献只解释线性模型如何计算当前分数，不是攻击归因、因果证明或自动处置依据。
 - AI 结论必须经过规则、上下文和人工复核；当前版本不可作为唯一拦截依据。
 
 ## 贡献
