@@ -22,8 +22,14 @@ class TrainingTests(unittest.TestCase):
             scores = [model.predict_probability(extract_features(flow)) for flow in flows]
         self.assertTrue(all(0.0 <= score <= 1.0 for score in scores))
         self.assertEqual(trained["metadata"]["training_rows"], len(flows))
+        self.assertRegex(model.model_version, r"^sha256:[0-9a-f]{12}$")
+
+    def test_explanation_rejects_invalid_limit(self):
+        model = LinearModel.load(ROOT / "models" / "baseline.json")
+        flow = read_flows(ROOT / "data" / "sample_flows.csv")[0]
+        with self.assertRaisesRegex(ValueError, "limit"):
+            model.explain(extract_features(flow), limit=0)
 
 
 if __name__ == "__main__":
     unittest.main()
-
