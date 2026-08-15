@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from .features import extract_features
 from .model import LinearModel
@@ -22,6 +22,10 @@ class DetectionResult:
     is_alert: bool
     reasons: list[str]
     rule_ids: list[str]
+    rule_evidence: list[dict[str, object]] = field(default_factory=list)
+    top_features: list[dict[str, object]] = field(default_factory=list)
+    model_algorithm: str = "unknown"
+    model_version: str = "unversioned"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -37,7 +41,8 @@ class HybridDetector:
         self.threshold = threshold
 
     def analyze(self, flow: FlowRecord) -> DetectionResult:
-        model_score = self.model.predict_probability(extract_features(flow))
+        features = extract_features(flow)
+        model_score = self.model.predict_probability(features)
         hits: list[RuleHit] = evaluate_rules(flow)
         rule_score = max((hit.score for hit in hits), default=0.0)
 
@@ -73,5 +78,12 @@ class HybridDetector:
             is_alert=risk_score >= self.threshold,
             reasons=reasons,
             rule_ids=[hit.rule_id for hit in hits],
+            rule_evidence=[{
+                "rule_id": hit.rule_id,
+                "score": round(hit.score, 4),
+                "reason": hit.reason,
+            } for hit in hits],
+            top_features=self.model.explain(features),
+            model_algorithm=self.model.algorithm,
+            model_version=self.model.model_version,
         )
-
