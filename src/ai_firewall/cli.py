@@ -118,6 +118,20 @@ def _print_result(result) -> None:
         f"[{icon:5}] risk={result.risk_score:.4f} severity={result.severity:8} "
         f"{result.src_ip} -> {result.dst_ip}:{result.dst_port}/{result.protocol} | {reason}"
     )
+    if result.is_alert:
+        features = ", ".join(
+            f"{item['name']}={item['value']:g} "
+            f"({item['direction']} {abs(item['contribution']):.4f})"
+            for item in result.top_features
+        )
+        rules = ", ".join(
+            f"{item['rule_id']}({item['score']:.2f})"
+            for item in result.rule_evidence
+        ) or "none"
+        print(
+            f"        model={result.model_algorithm}@{result.model_version} | "
+            f"top_features={features} | rules={rules}"
+        )
 
 
 def run_demo(args: argparse.Namespace) -> int:
