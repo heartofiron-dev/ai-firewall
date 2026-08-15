@@ -16,6 +16,7 @@ from .windows_capture import capture_with_pktmon
 from .benchmark import build_benchmark_report, write_benchmark_report
 from .datasets import iter_dataset
 from .comparison import build_model_comparison, write_comparison_report
+from .dashboard import serve_dashboard
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -104,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--seed", type=int, default=42)
     compare.add_argument("--output", default="model-comparison.json")
     compare.add_argument("--overwrite", action="store_true")
+
+    dashboard = sub.add_parser("dashboard", help="启动只绑定本机的告警与连接仪表盘")
+    dashboard.add_argument("--input", default="alerts.jsonl", help="analyze/monitor 生成的 JSONL")
+    dashboard.add_argument("--feedback", default="feedback/pending.jsonl", help="独立误报审核队列")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--max-alerts", type=int, default=500)
     return parser
 
 
@@ -309,6 +316,13 @@ def run_compare_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_dashboard(args: argparse.Namespace) -> int:
+    serve_dashboard(
+        args.input, args.feedback, port=args.port, max_alerts=args.max_alerts,
+    )
+    return 0
+
+
 def run_monitor(args: argparse.Namespace) -> int:
     if args.interval <= 0 or args.duration < 0:
         raise ValueError("interval 必须大于 0，duration 不能小于 0")
@@ -365,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         "benchmark": run_benchmark,
         "convert-dataset": run_convert_dataset,
         "compare-models": run_compare_models,
+        "dashboard": run_dashboard,
     }
     try:
         return actions[args.command](args)
