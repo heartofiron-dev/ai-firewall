@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测、审核与受控响应平台，不是生产级防火墙。** v1.0 默认仍只分析和告警；Windows 防火墙命令默认只生成计划，必须人工复核并显式输入二次确认才会执行。仓库从不自动抓包、自动训练或自动封禁。
+> **当前定位：检测、审核与受控响应平台，不是生产级防火墙。** v1.1 默认仍只分析和告警；Windows 防火墙命令默认只生成计划，必须人工复核并显式输入二次确认才会执行。仓库从不自动抓包、自动训练或自动封禁。
 
 ## 已经完成了什么
 
@@ -15,6 +15,7 @@
 - 实现不依赖第三方机器学习包的逻辑回归训练器，可使用自己的带标签 CSV 重新训练。
 - 实现 precision、recall、false positive rate 等评估指标。
 - 提供安全的模拟数据、自动化测试和 GitHub Actions 持续集成。
+- 提供强制锁定 `127.0.0.1` 的本机 Socket 实验：只连接程序自己占用的端口，真实产生有上限的正常访问、扫描形态、虚拟认证拒绝、连接突增、数据突增和可疑端口行为。
 - 所有分析默认在本机完成，不上传网络记录。
 - 支持直接读取 classic PCAP，将 Ethernet、RAW 或 Linux SLL 中的 IPv4/IPv6 TCP/UDP 包聚合成网络流。
 - 支持 Windows 实时 TCP 连接监控，展示进程、PID、连接方向、状态、风险和告警原因。
@@ -36,7 +37,7 @@
 
 ```mermaid
 flowchart LR
-    A[PCAP / 系统连接事件] --> B[网络流聚合]
+    A[Loopback 实验 / PCAP / 系统连接事件] --> B[网络流聚合]
     B --> C[CSV 标准格式]
     C --> D[10 个统计特征]
     D --> E[轻量 AI 模型]
@@ -91,6 +92,46 @@ ai-firewall demo
 ```
 
 演示会分析 2 条正常样本和 4 条攻击模拟样本。它只读取仓库内的 CSV，不发送攻击流量，也不会修改系统配置。
+
+## 本机 Loopback 安全实验
+
+v1.1 可以在当前电脑上产生真实的 TCP Socket 行为，而不是直接读取预先写好的模拟 CSV。命令没有目标地址参数，只允许连接 `127.0.0.1`，并且每个目标端口必须先由实验程序自己成功绑定；因此不会扫描局域网、公网或碰触本机已有服务。
+
+运行全部场景需要显式确认：
+
+```powershell
+ai-firewall lab-simulate --confirm LOCAL-LAB --output lab-report.json
+```
+
+也可以只运行一个场景：
+
+```powershell
+ai-firewall lab-simulate --scenario port-scan --confirm LOCAL-LAB
+```
+
+| 场景 | 实际本机行为 | 期望结果 |
+|---|---|---|
+| `normal` | 访问程序自己的临时 HTTP 服务一次 | 不告警 |
+| `port-scan` | 依次连接程序自己占用的 20 个临时端口 | `PORT_SCAN` |
+| `brute-force` | 虚拟认证服务拒绝 12 次固定测试令牌 | `BRUTE_FORCE` |
+| `connection-flood` | 向一个临时服务建立 220 个有上限的短连接 | `CONNECTION_FLOOD` |
+| `data-spike` | 向临时接收器传输 50.5 MB 内存生成数据 | `DATA_SPIKE` |
+| `suspicious-port` | 连接程序自己占用的 4444/5555/6667/31337 之一 | `SUSPICIOUS_PORT` |
+
+实验具有以下不可绕过的边界：
+
+- 必须输入准确确认词 `LOCAL-LAB`，否则在创建任何 Socket 前退出；
+- 不接受 IP、主机名、端口列表或流量规模参数；
+- 只使用 IPv4 loopback `127.0.0.1`，不访问局域网或互联网；
+- 只连接程序自己成功占用的监听端口；端口被其他程序使用时不会连接它；
+- 不使用系统账户、真实密码、漏洞利用、恶意软件、原始套接字或管理员权限；
+- 不启动 `pktmon`、不保存 PCAP、不读取其他进程连接，也不修改 Windows 防火墙；
+- 数据突增使用重复内存字节，不读取磁盘文件；全部场景都有固定数量和 Socket 超时；
+- `lab-report.json` 只包含 loopback 实验元数据和检测结果，已被 `.gitignore` 排除。
+
+这个实验可以验证本机 Socket 行为、特征、模型、规则和告警闭环，但包数量是按 Socket 操作/字节数估算的，不验证 `pktmon` 或物理网卡抓包。它也不能替代获授权、脱敏、跨日的真实正常流量误报基线。
+
+项目所有者电脑上的一次脱敏实测结果见 [`docs/loopback-lab-results-v1.1.0.md`](docs/loopback-lab-results-v1.1.0.md)。原始本地报告仍被 `.gitignore` 排除。
 
 ## 功能使用方法
 
@@ -515,6 +556,8 @@ python -m unittest discover -s tests -v
 - SSH/RDP 爆破能被识别；
 - 连接洪泛会得到最高严重级别；
 - 异常大流量与可疑端口能同时留下证据；
+- 单独命中可疑端口时，规则保底分数也能越过默认告警阈值；
+- 本机实验没有确认词时不会创建 Socket，拒绝非 loopback 地址和未由程序占用的端口；实际正常 HTTP loopback 场景可以完成收发；
 - 训练结果能保存、重新加载并给出 0～1 概率。
 - 合成 classic PCAP 能正确解析 TCP 五元组并计算 60 秒上下文；损坏文件会被拒绝。
 - Windows PowerShell JSON 能转换为连接对象，入站/出站方向推断和长连接去重有效。
@@ -545,6 +588,7 @@ python -m unittest discover -s tests -v
 9. 执行 `ai-firewall firewall-block 8.8.8.8 --duration 600`，确认输出 `dry_run: true`；不要在日常电脑上添加 `--apply` 做演示。
 10. 在临时目录生成签名密钥和 `.aifw`，验证正确固定版本可以安装、错误版本失败，并删除临时私钥。
 11. 执行 `performance-test`，确认生成报告且门槛决定退出码；只用合成报告测试 `baseline-gate` 的程序分支，不能把它当作真实验证。
+12. 执行 `lab-simulate --confirm LOCAL-LAB`，确认六个场景均为 `PASSED`；检查报告声明 `packet_capture=false`、`firewall_changes=false`，不要把它解释为跨日误报基线。
 
 ### 真实环境测试原则
 
@@ -573,6 +617,7 @@ ai-firewall/
 │   ├── feedback.py             # 隔离审核账本与受控反馈再训练
 │   ├── firewall.py             # 默认关闭的 Windows 临时规则与回滚
 │   ├── io.py                   # CSV 与 JSONL 输入输出
+│   ├── lab.py                  # 仅限 loopback 的实际 Socket 安全实验
 │   ├── model.py                # 模型加载和推理
 │   ├── pcap.py                 # 纯 Python classic PCAP 解析与流聚合
 │   ├── performance.py          # CPU、内存、吞吐与延迟报告
@@ -615,6 +660,7 @@ ai-firewall/
 | P1 | Windows 包级采集 | 使用 pktmon 限时采集、转 PCAPNG 并可直接检测 | ✅ v0.3 |
 | P1 | IPv6 扩展头 | 安全遍历常见扩展头并限制解析深度 | ✅ v0.5 |
 | P1 | 数据集转换器 | CICIDS、UNSW-NB15 分别有转换脚本与字段测试 | ✅ v0.6 |
+| P1 | 本机 Loopback 实验 | 只连接自己占用的本机端口；六类有上限场景和报告完整 | ✅ v1.1 |
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | ✅ v0.7 |
 | P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | ✅ v0.8 |
 | P2 | 本地界面 | 查看实时连接、筛选告警、标记误报 | ✅ v0.9 |
@@ -636,6 +682,7 @@ ai-firewall/
 
 - 本项目不包含漏洞利用代码，也不需要主动攻击其他设备。
 - 仅在你拥有或明确获准测试的网络上采集与验证。
+- `lab-simulate` 只用于当前电脑的 loopback 实验；不得修改代码解除 loopback、端口所有权、固定数量、超时或确认词限制后去测试其他目标。
 - `baseline.json` 是开发启动模型，不代表已经过真实环境验证。
 - 不要把密码、Cookie、API key、原始私密流量或个人身份信息提交到仓库。
 - 不要提交完整公开数据集或其大规模派生文件；只提交许可清楚、不含个人信息的最小合成测试数据。
