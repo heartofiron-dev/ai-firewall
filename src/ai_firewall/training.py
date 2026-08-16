@@ -30,10 +30,37 @@ def train_logistic_model(
     if len(flows) < 4:
         raise ValueError("至少需要 4 条带标签记录")
     labels = [label_to_int(flow.label) for flow in flows]
+    rows = [extract_features(flow) for flow in flows]
+    return train_logistic_features(
+        rows, labels, epochs=epochs, learning_rate=learning_rate, seed=seed,
+    )
+
+
+def train_logistic_features(
+    feature_rows: list[dict[str, float]], labels: list[int], epochs: int = 800,
+    learning_rate: float = 0.08, seed: int = 42,
+) -> dict[str, object]:
+    """Train the built-in model from reviewed, metadata-free feature rows."""
+    if len(feature_rows) < 4 or len(feature_rows) != len(labels):
+        raise ValueError("至少需要 4 条且特征与标签数量必须一致")
+    if epochs < 1 or not 0.0 < learning_rate <= 1.0:
+        raise ValueError("epochs 必须大于 0，learning_rate 必须在 0 和 1 之间")
+    if any(label not in {0, 1} for label in labels):
+        raise ValueError("训练标签只能是 0 或 1")
     if len(set(labels)) < 2:
         raise ValueError("训练数据必须同时包含正常和攻击样本")
 
-    rows = [[extract_features(flow)[name] for name in FEATURE_NAMES] for flow in flows]
+    rows = []
+    for index, item in enumerate(feature_rows, start=1):
+        if set(item) != set(FEATURE_NAMES):
+            raise ValueError(f"第 {index} 条特征与当前模型不兼容")
+        try:
+            row = [float(item[name]) for name in FEATURE_NAMES]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"第 {index} 条特征不是有效数字") from exc
+        if not all(math.isfinite(value) for value in row):
+            raise ValueError(f"第 {index} 条特征包含非有限值")
+        rows.append(row)
     count = len(rows)
     means = [sum(row[i] for row in rows) / count for i in range(len(FEATURE_NAMES))]
     scales = []
@@ -79,4 +106,3 @@ def train_logistic_model(
 
 def save_model(model: dict[str, object], path: str | Path) -> None:
     Path(path).write_text(json.dumps(model, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-

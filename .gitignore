@@ -1,18 +1,37 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
-venv/
-dist/
-build/
-*.egg-info/
+# Local alerts, reviews, state and reports may contain sensitive metadata.
+*.jsonl
+feedback/
+state/
 alerts.jsonl
+live-alerts.jsonl
 *-alerts.jsonl
 current-connections.jsonl
-flows.csv
-captured-flows.csv
+*-report.json
+benchmark-report.json
+provenance.json
+
+# Captures and converted local traffic must never be committed.
 *.pcap
 *.pcapng
 *.etl
-benchmark-report.json
+captured-flows.csv
+converted-flows.csv
+flows.csv
+
+# Signing secrets and local update artifacts.
+*.pem
+*.key
+*.aifw
+keys/
+releases/
 models/trained-*.json
+
+# Python build and environment files.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
