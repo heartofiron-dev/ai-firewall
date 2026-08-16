@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 import zipfile
@@ -61,9 +60,9 @@ class UpdateTests(unittest.TestCase):
                 for name in source.namelist():
                     payload = source.read(name)
                     if name == "model.json":
-                        data = json.loads(payload)
-                        data["bias"] = float(data["bias"]) + 1
-                        payload = json.dumps(data).encode()
+                        # Preserve the declared byte length so this specifically
+                        # exercises the SHA-256 integrity check.
+                        payload = payload[:-1] + (b" " if payload[-1:] != b" " else b"\n")
                     output.writestr(name, payload)
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 verify_signed_bundle(tampered, public, expected_version="1.0.0")
