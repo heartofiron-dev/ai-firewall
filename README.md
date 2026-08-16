@@ -4,7 +4,7 @@
 
 一个在本机运行的、以隐私优先为原则的 AI 网络入侵检测原型。项目把可解释的安全规则与轻量统计模型结合，对网络流元数据进行风险评分，并输出结构化告警。
 
-> **当前定位：检测与研究，不是生产级防火墙。** v0.9 默认只分析和告警，不修改 Windows 防火墙，也不自动封禁 IP。这样可以先测量误报率，再逐步开放拦截能力。
+> **当前定位：检测、审核与受控响应平台，不是生产级防火墙。** v1.0 默认仍只分析和告警；Windows 防火墙命令默认只生成计划，必须人工复核并显式输入二次确认才会执行。仓库从不自动抓包、自动训练或自动封禁。
 
 ## 已经完成了什么
 
@@ -27,6 +27,10 @@
 - 支持在完全相同的时间切分、特征和误报目标下，对比逻辑回归、Isolation Forest 与 LightGBM。
 - 每条告警同时输出结构化规则证据、线性模型前三项特征贡献、算法和模型版本。
 - 提供只绑定本机的零依赖仪表盘，可自动刷新连接/告警、筛选记录并标记待审核误报。
+- 实现隔离反馈闭环：短指纹进入待审核队列，人工批准后只提取数值特征，再与授权基线数据受限合并训练；拒绝反馈和未审核反馈永不进入模型。
+- 提供默认 dry-run 的 Windows 防火墙集成，内置允许名单、60 秒至 24 小时临时规则、到期清理、托管规则回滚和 kill switch。
+- 提供 Ed25519 模型更新包、固定版本验证、SHA-256 完整性检查、原子安装和失败/手工回滚。
+- 提供可复现的 CPU、Python 内存、吞吐与 p50/p95/p99 延迟报告，以及带授权/脱敏声明的真实环境发布门槛审核。
 
 ## 系统如何工作
 
@@ -41,11 +45,13 @@ flowchart LR
     F --> G
     G --> H[终端提示 / JSONL 告警]
     H --> K[本地仪表盘]
-    K --> I[人工确认]
-    I --> J[未来：防火墙策略]
+    K --> I[隔离队列 / 人工审核]
+    I --> L[受控反馈再训练]
+    I --> J[默认关闭的临时防火墙响应]
+    L --> M[签名模型更新 / 回滚]
 ```
 
-当前仓库已经实现图中的 classic PCAP/PCAPNG、IPv6 扩展头、双向网络流聚合、Windows 连接与包级采集、公开数据集适配、三模型公平对比、CSV、特征、模型、规则、评分、结构化解释、提示、JSONL 输出和本地仪表盘。长期后台服务与防火墙策略属于后续阶段。
+当前仓库已经实现图中的全部软件链路。真实环境发布结论仍必须由使用者在获得授权、完成脱敏的跨日独立数据上运行 `benchmark` 与 `baseline-gate`；演示数据不能替代这项外部验收。
 
 ## 当前能识别的行为
 
@@ -231,6 +237,7 @@ ai-firewall analyze data/sample_flows.csv --threshold 0.70
 | `top_features` | 特征原值、标准化值、权重、logit 贡献与风险方向 |
 | `model_algorithm` | 模型元数据中的算法名 |
 | `model_version` | 模型声明的版本；旧模型未声明时使用稳定的内容 SHA-256 短指纹 |
+| `feature_snapshot` | 10 个纯数值特征；只用于把经人工批准的反馈接入受控再训练，不含 IP/进程/时间 |
 
 `top_features` 是线性模型对本次评分的精确数学拆解，正贡献表示推高模型风险，负贡献表示降低模型风险。它用于审查模型判断，不代表因果关系，也不能单独证明攻击成立。
 
@@ -341,6 +348,136 @@ ai-firewall dashboard --input live-alerts.jsonl --feedback feedback/pending.json
 
 安全约束包括：固定绑定 `127.0.0.1`、拒绝非本机 `Host`、写操作要求随机会话令牌、严格 CSP/同源响应头、输入与反馈文件分离、拒绝符号链接，并对请求体和文件大小设置上限。端口可用 `--port` 调整，单页最多显示数量可用 `--max-alerts` 调整。
 
+### 7. 审核反馈并受控再训练
+
+v1.0 的新告警包含完整的 10 维数值 `feature_snapshot`。仪表盘仍只把告警短指纹写入 `feedback/pending.jsonl`；审核命令使用短指纹回到原告警文件取数值特征，不把 IP、端口、进程名或时间写入训练账本。
+
+先逐条批准或拒绝；也可以用 `--all` 处理当前全部待办：
+
+```bash
+ai-firewall review-feedback \
+  --alerts alerts.jsonl \
+  --pending feedback/pending.jsonl \
+  --reviewed feedback/reviewed.jsonl \
+  --decision approve \
+  --alert-id 0123456789abcdef \
+  --reviewer local-user
+```
+
+只有 `decision=approve` 且原反馈为 `false_positive` 的记录会得到 `training_label=0` 和特征快照。审核是追加、幂等的；同一短指纹不会重复写入。旧版告警没有完整特征快照时会拒绝批准，不能猜测或补造训练特征。
+
+再以一份已授权、带标签且同时包含正常/攻击样本的基础 CSV 重新训练：
+
+```bash
+ai-firewall retrain-feedback authorized-base.csv \
+  --reviewed feedback/reviewed.jsonl \
+  --output models/feedback-model.json
+```
+
+默认最多允许已批准反馈占基础集的 20%，避免少量恶意或错误反馈主导模型；可降低 `--max-feedback-fraction`，但最高不能超过 50%。命令记录审核账本 SHA-256、批准数量和策略，不会自动替换当前模型。训练后仍应执行时间独立评估与签名发布。
+
+### 8. Windows 防火墙受控响应
+
+先生成计划；下面的默认命令不会修改系统：
+
+```powershell
+ai-firewall firewall-block 8.8.8.8 --duration 600
+```
+
+保护规则：只接受单个有效 IP；默认允许名单保护 loopback、链路本地、RFC1918 私网和 IPv6 ULA；自定义 CIDR 可放入文本文件并用 `--allowlist` 加载；时长只能是 60～86400 秒。实际执行需要管理员权限和两层显式开关：
+
+```powershell
+# 仅在你拥有或获准管理的 Windows 设备上执行
+ai-firewall firewall-block 8.8.8.8 --duration 600 --apply --confirm APPLY
+```
+
+到期规则不会依赖常驻高权限服务，需由管理员按自己的变更流程定期运行清理；回滚只删除 `AI-Firewall-*` 托管规则：
+
+```powershell
+ai-firewall firewall-cleanup --apply --confirm CLEANUP
+ai-firewall firewall-rollback --apply --confirm ROLLBACK
+```
+
+紧急关闭会先写入本地 marker，后续封禁立即失败；可选择同时回滚：
+
+```powershell
+ai-firewall firewall-kill-switch --rollback --confirm ROLLBACK
+ai-firewall firewall-enable --confirm ENABLE
+```
+
+规则状态只保存在本机 `state/firewall-rules.json`。本项目不会根据模型分数自动调用以上执行命令，也没有在本次发布中对真实 Windows 防火墙做改动。
+
+### 9. 模型签名、固定版本更新与回滚
+
+签名工具需要可选依赖：
+
+```bash
+python -m pip install -e ".[updates]"
+```
+
+生成 Ed25519 密钥；私钥必须离线保管，`*.pem` 已被 `.gitignore` 排除，绝不能提交：
+
+```bash
+ai-firewall generate-signing-key --private-key keys/model-private.pem --public-key keys/model-public.pem
+ai-firewall sign-model models/trained-model.json \
+  --private-key keys/model-private.pem --version 1.0.0 \
+  --output releases/model-1.0.0.aifw
+```
+
+安装时必须固定预期版本。程序只接受恰好三个成员的 `.aifw` 包，先验证 Ed25519、规范 manifest、模型 SHA-256、大小、特征兼容性和版本，再原子替换目标并保留 `.rollback`：
+
+```bash
+ai-firewall install-model-update releases/model-1.0.0.aifw \
+  --public-key keys/model-public.pem \
+  --expected-version 1.0.0 \
+  --target models/active.json
+
+ai-firewall rollback-model --target models/active.json
+```
+
+签名或校验失败不会改动目标；替换后的模型若无法重新加载，会自动恢复备份。模型更新只更新本地模型文件，不启动监控、采集或封禁。
+
+### 10. 性能测试
+
+在目标电脑上用固定输入、迭代次数和门槛生成 JSON 报告：
+
+```bash
+ai-firewall performance-test data/sample_flows.csv \
+  --iterations 500 --warmup 20 \
+  --max-p95-ms 5 --max-peak-mib 128 \
+  --output performance-report.json
+```
+
+报告包含 Python/系统架构（不含主机名）、模型与阈值、处理量、单核 CPU 时间比例、吞吐量、p50/p95/p99/最大延迟和 `tracemalloc` Python 峰值内存。`passed=false` 时命令返回非零退出码，适合 CI 或目标设备验收。`tracemalloc` 不等于整个进程 RSS，因此生产容量规划还应配合操作系统级测量。
+
+### 11. 真实环境发布门槛
+
+先在获授权、脱敏、跨日数据上运行 `benchmark`。再准备一个不含流量内容的来源声明 JSON，至少包含：
+
+```json
+{
+  "environment_id": "authorized-lab-a",
+  "authorization_scope": "owner-approved endpoint metadata",
+  "collection_period": "three or more independent days",
+  "labeling_method": "manual review plus controlled replay",
+  "authorization_confirmed": true,
+  "anonymization_confirmed": true,
+  "private_payloads_excluded": true,
+  "independent_holdout_confirmed": true
+}
+```
+
+执行硬门槛审核：
+
+```bash
+ai-firewall baseline-gate benchmark-report.json provenance.json \
+  --min-days 3 --min-benign-rows 1000 \
+  --max-fpr 0.01 --max-false-positives-per-day 10 \
+  --min-recall 0.80 --output baseline-gate-report.json
+```
+
+缺少任一授权/脱敏/独立留出声明或指标不达标时返回非零退出码。仓库没有真实私密数据，因此 v1.0 只完成验收工具，不能声称真实环境门槛已经通过。
+
 ## CSV 数据格式
 
 | 字段 | 类型 | 含义 |
@@ -364,10 +501,10 @@ ai-firewall dashboard --input live-alerts.jsonl --feedback feedback/pending.json
 
 ### 一键运行全部自动化测试
 
-包含真实 Isolation Forest / LightGBM 集成测试时，先安装 `comparison` 依赖组：
+包含真实 Isolation Forest / LightGBM 和 Ed25519 更新集成测试时，安装两个可选依赖组：
 
 ```bash
-python -m pip install -e ".[comparison]"
+python -m pip install -e ".[comparison,updates]"
 python -m unittest discover -s tests -v
 ```
 
@@ -390,6 +527,10 @@ python -m unittest discover -s tests -v
 - 三模型共享同一训练/校准/测试时间边界和测试行数；真实 scikit-learn、LightGBM 适配器会完成训练、阈值校准和独立测试指标输出。
 - 规则证据与旧 `rule_ids` 一致；前三项模型贡献按绝对值排序，显式版本和旧模型内容指纹均可追踪。
 - 本地仪表盘会正确筛选可见字段、容忍尚未写完的 JSONL 行，拒绝恶意 Host/无令牌写入，并把误报幂等写入隔离审核队列。
+- 反馈只有经过显式批准、能与原告警短指纹匹配且具有完整数值快照时才能参与训练；账本去重、反馈比例上限和来源哈希有效。
+- 防火墙默认只生成计划，保护默认允许名单，执行/回滚/到期清理均要求不同确认词，kill switch 会阻止新规则。
+- Ed25519 更新包会拒绝错误固定版本、篡改模型、额外成员和无效签名；安装保留可验证回滚副本。
+- 性能报告包含 CPU/内存/吞吐和延迟分位数；真实基线门槛会同时核验指标与授权、脱敏、独立留出声明。
 
 ### 手工验收清单
 
@@ -400,6 +541,10 @@ python -m unittest discover -s tests -v
 5. 执行评估命令，确认 precision、recall 与误报率均有输出。
 6. 向 CSV 删除一个必需字段，程序应清楚提示缺少字段，而不是静默跳过。
 7. 执行 `ai-firewall dashboard --input alerts.jsonl`，确认页面能筛选告警；标记误报后只新增本地 `feedback/pending.jsonl`，模型和防火墙均不变化。
+8. 对一个短指纹分别执行 `review-feedback` 和 `retrain-feedback`，确认审核账本没有 IP/进程，模型元数据包含账本 SHA-256，且旧模型未被自动替换。
+9. 执行 `ai-firewall firewall-block 8.8.8.8 --duration 600`，确认输出 `dry_run: true`；不要在日常电脑上添加 `--apply` 做演示。
+10. 在临时目录生成签名密钥和 `.aifw`，验证正确固定版本可以安装、错误版本失败，并删除临时私钥。
+11. 执行 `performance-test`，确认生成报告且门槛决定退出码；只用合成报告测试 `baseline-gate` 的程序分支，不能把它当作真实验证。
 
 ### 真实环境测试原则
 
@@ -418,18 +563,23 @@ ai-firewall/
 ├── models/baseline.json        # 开发用启动模型
 ├── src/ai_firewall/
 │   ├── cli.py                  # 命令行入口与安全输出处理
+│   ├── baseline_gate.py        # 真实数据来源声明与发布硬门槛
 │   ├── benchmark.py            # 时间切分、阈值校准与逐日误报报告
 │   ├── comparison.py           # 三模型共享时间切分与公平评估
 │   ├── dashboard.py            # 回环地址仪表盘与隔离误报队列
 │   ├── detector.py             # 混合评分与告警结果
 │   ├── datasets.py             # CICIDS2017 / UNSW-NB15 安全转换器
 │   ├── features.py             # 特征提取
+│   ├── feedback.py             # 隔离审核账本与受控反馈再训练
+│   ├── firewall.py             # 默认关闭的 Windows 临时规则与回滚
 │   ├── io.py                   # CSV 与 JSONL 输入输出
 │   ├── model.py                # 模型加载和推理
 │   ├── pcap.py                 # 纯 Python classic PCAP 解析与流聚合
+│   ├── performance.py          # CPU、内存、吞吐与延迟报告
 │   ├── rules.py                # 可解释安全规则
 │   ├── schema.py               # 网络流数据结构
 │   ├── training.py             # 逻辑回归训练器
+│   ├── updates.py              # Ed25519 签名更新、固定版本与回滚
 │   ├── windows_capture.py      # pktmon 限时采集、ETL 转 PCAPNG
 │   └── windows_monitor.py      # Windows 连接、进程和滚动窗口监控
 ├── tests/                      # 自动化测试
@@ -458,7 +608,7 @@ ai-firewall/
 | P0 | 完成离线检测闭环 | CSV → 特征 → 模型/规则 → JSONL 告警 | ✅ v0.1 |
 | P0 | 建立自动化测试 | Python 3.10/3.12 在 GitHub Actions 通过 | ✅ v0.1 |
 | P0 | 误报基线工具 | 时间切分、阈值校准、独立测试集每日误报与 FPR 报告 | ✅ v0.4 |
-| P0 | 真实环境误报基线 | 在获授权且脱敏的跨日独立数据上达到发布门槛 | 待数据 |
+| P0 | 真实环境误报基线 | 在获授权且脱敏的跨日独立数据上达到发布门槛 | 🟡 v1.0 验收工具完成；待真实数据运行 |
 | P1 | PCAP 转换器 | 可将授权的 classic PCAP 聚合成本项目 CSV，不保存载荷 | ✅ v0.2 |
 | P1 | Windows 实时采集 | 低权限优先；展示进程、目的地和连接统计 | ✅ v0.2 基础版 |
 | P1 | PCAPNG 与双向流 | 支持多接口 PCAPNG 与双向字节统计 | ✅ v0.3 |
@@ -468,10 +618,10 @@ ai-firewall/
 | P1 | 模型对比 | 逻辑回归、Isolation Forest、LightGBM 使用同一时间切分评估 | ✅ v0.7 |
 | P1 | 可解释性 | 每条告警显示主要特征、规则证据和模型版本 | ✅ v0.8 |
 | P2 | 本地界面 | 查看实时连接、筛选告警、标记误报 | ✅ v0.9 |
-| P2 | 反馈学习 | 用户反馈进入隔离队列，经审核后再训练 | 待办 |
-| P2 | Windows 防火墙集成 | 默认关闭；允许名单、临时封禁、回滚和 kill switch 齐全 | 待办 |
-| P2 | 模型签名与更新 | 更新包签名、版本固定、失败自动回滚 | 待办 |
-| P2 | 性能测试 | 目标设备 CPU/内存/延迟有可复现实验报告 | 待办 |
+| P2 | 反馈学习 | 用户反馈进入隔离队列，经审核后再训练 | ✅ v1.0 |
+| P2 | Windows 防火墙集成 | 默认关闭；允许名单、临时封禁、回滚和 kill switch 齐全 | ✅ v1.0（未在真实防火墙执行） |
+| P2 | 模型签名与更新 | 更新包签名、版本固定、失败自动回滚 | ✅ v1.0 |
+| P2 | 性能测试 | 目标设备 CPU/内存/延迟有可复现实验报告 | ✅ v1.0 工具与合成基线；目标设备应复测 |
 
 ### 每次发布前的维护事项
 
@@ -493,7 +643,10 @@ ai-firewall/
 - 特征贡献只解释线性模型如何计算当前分数，不是攻击归因、因果证明或自动处置依据。
 - 本地仪表盘只应在当前电脑上访问；不要用端口转发、反向代理或修改代码的方式把它暴露到局域网或互联网。
 - `feedback/pending.jsonl` 只是待审核标记，不得未经人工确认直接混入训练数据；它可能仍与本机告警时间相关，应按日志敏感度保护。
-- AI 结论必须经过规则、上下文和人工复核；当前版本不可作为唯一拦截依据。
+- `feature_snapshot` 是数值元数据，仍可能间接反映行为模式；反馈与审核文件不得提交。反馈批准不能替代独立测试。
+- 防火墙命令默认 dry-run；不要为了演示启用 `--apply`。实际变更前必须核对 IP、允许名单、管理员权限、到期清理和回滚流程。
+- 私钥、`.aifw` 测试包、真实性能报告、来源声明和本地状态均不得无审查提交；可信公钥应通过独立渠道固定。
+- AI 结论必须经过规则、上下文和人工复核；当前版本不可作为唯一拦截依据，真实环境门槛通过也不等于允许自动封禁。
 
 ## 贡献
 
