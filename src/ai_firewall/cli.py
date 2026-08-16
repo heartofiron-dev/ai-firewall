@@ -17,6 +17,16 @@ from .benchmark import build_benchmark_report, write_benchmark_report
 from .datasets import iter_dataset
 from .comparison import build_model_comparison, write_comparison_report
 from .dashboard import serve_dashboard
+from .feedback import build_feedback_model, review_feedback
+from .firewall import (
+    activate_kill_switch, apply_temporary_block, cleanup_expired_rules,
+    deactivate_kill_switch, plan_temporary_block, rollback_rules,
+)
+from .updates import (
+    create_signed_bundle, generate_signing_keys, install_signed_bundle, rollback_model,
+)
+from .performance import build_performance_report, write_performance_report
+from .baseline_gate import evaluate_baseline_gate, write_gate_report
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -111,6 +121,96 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--feedback", default="feedback/pending.jsonl", help="独立误报审核队列")
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--max-alerts", type=int, default=500)
+
+    review = sub.add_parser("review-feedback", help="人工批准或拒绝隔离队列中的反馈")
+    review.add_argument("--alerts", required=True, help="生成反馈时对应的告警 JSONL")
+    review.add_argument("--pending", default="feedback/pending.jsonl")
+    review.add_argument("--reviewed", default="feedback/reviewed.jsonl")
+    review.add_argument("--decision", required=True, choices=("approve", "reject"))
+    selection = review.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--alert-id", action="append", help="可重复指定短指纹")
+    selection.add_argument("--all", action="store_true", help="审核队列中的全部待办")
+    review.add_argument("--reviewer", default="local-user")
+
+    retrain = sub.add_parser("retrain-feedback", help="用授权基线数据和已批准反馈重新训练")
+    retrain.add_argument("base_csv", help="已授权、带标签的基础训练 CSV")
+    retrain.add_argument("--reviewed", default="feedback/reviewed.jsonl")
+    retrain.add_argument("--output", default="models/feedback-model.json")
+    retrain.add_argument("--epochs", type=int, default=800)
+    retrain.add_argument("--learning-rate", type=float, default=0.08)
+    retrain.add_argument("--max-feedback-fraction", type=float, default=0.20)
+    retrain.add_argument("--overwrite", action="store_true")
+
+    fw_block = sub.add_parser("firewall-block", help="规划或显式执行 Windows 临时封禁")
+    fw_block.add_argument("address")
+    fw_block.add_argument("--duration", type=int, default=600, help="60..86400 秒")
+    fw_block.add_argument("--allowlist")
+    fw_block.add_argument("--state", default="state/firewall-rules.json")
+    fw_block.add_argument("--apply", action="store_true", help="实际修改 Windows 防火墙")
+    fw_block.add_argument("--confirm", default="", help="实际执行必须为 APPLY")
+
+    fw_rollback = sub.add_parser("firewall-rollback", help="回滚 AI Firewall 托管规则")
+    fw_rollback.add_argument("--state", default="state/firewall-rules.json")
+    fw_rollback.add_argument("--apply", action="store_true")
+    fw_rollback.add_argument("--confirm", default="", help="实际执行必须为 ROLLBACK")
+
+    fw_cleanup = sub.add_parser("firewall-cleanup", help="删除已到期的托管临时封禁规则")
+    fw_cleanup.add_argument("--state", default="state/firewall-rules.json")
+    fw_cleanup.add_argument("--apply", action="store_true")
+    fw_cleanup.add_argument("--confirm", default="", help="实际执行必须为 CLEANUP")
+
+    kill = sub.add_parser("firewall-kill-switch", help="禁止新增规则，可选择回滚全部托管规则")
+    kill.add_argument("--state", default="state/firewall-rules.json")
+    kill.add_argument("--rollback", action="store_true")
+    kill.add_argument("--confirm", default="", help="回滚时必须为 ROLLBACK")
+
+    enable_fw = sub.add_parser("firewall-enable", help="关闭 kill switch，重新允许显式封禁")
+    enable_fw.add_argument("--state", default="state/firewall-rules.json")
+    enable_fw.add_argument("--confirm", default="", help="必须为 ENABLE")
+
+    keys = sub.add_parser("generate-signing-key", help="生成本地 Ed25519 模型签名密钥")
+    keys.add_argument("--private-key", required=True)
+    keys.add_argument("--public-key", required=True)
+    keys.add_argument("--overwrite", action="store_true")
+
+    sign = sub.add_parser("sign-model", help="创建经 Ed25519 签名的 .aifw 更新包")
+    sign.add_argument("model")
+    sign.add_argument("--private-key", required=True)
+    sign.add_argument("--version", required=True)
+    sign.add_argument("--min-app-version", default="1.0.0")
+    sign.add_argument("--output", required=True)
+    sign.add_argument("--overwrite", action="store_true")
+
+    install = sub.add_parser("install-model-update", help="验证签名和固定版本后原子更新模型")
+    install.add_argument("bundle")
+    install.add_argument("--public-key", required=True)
+    install.add_argument("--expected-version", required=True)
+    install.add_argument("--target", required=True)
+
+    model_rollback = sub.add_parser("rollback-model", help="恢复上一次已验证模型")
+    model_rollback.add_argument("--target", required=True)
+
+    perf = sub.add_parser("performance-test", help="生成可复现的 CPU/内存/延迟报告")
+    perf.add_argument("input")
+    perf.add_argument("--model", default=str(DEFAULT_MODEL))
+    perf.add_argument("--threshold", type=float, default=0.60)
+    perf.add_argument("--iterations", type=int, default=100)
+    perf.add_argument("--warmup", type=int, default=10)
+    perf.add_argument("--max-p95-ms", type=float, default=5.0)
+    perf.add_argument("--max-peak-mib", type=float, default=128.0)
+    perf.add_argument("--output", default="performance-report.json")
+    perf.add_argument("--overwrite", action="store_true")
+
+    gate = sub.add_parser("baseline-gate", help="审核真实环境误报基线是否达到发布门槛")
+    gate.add_argument("benchmark_report")
+    gate.add_argument("provenance", help="授权、脱敏和独立留出声明 JSON")
+    gate.add_argument("--min-days", type=int, default=3)
+    gate.add_argument("--min-benign-rows", type=int, default=1000)
+    gate.add_argument("--max-fpr", type=float, default=0.01)
+    gate.add_argument("--max-false-positives-per-day", type=float, default=10.0)
+    gate.add_argument("--min-recall", type=float, default=0.80)
+    gate.add_argument("--output", default="baseline-gate-report.json")
+    gate.add_argument("--overwrite", action="store_true")
     return parser
 
 
@@ -323,6 +423,174 @@ def run_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_review_feedback(args: argparse.Namespace) -> int:
+    report = review_feedback(
+        args.alerts, args.pending, args.reviewed,
+        decision=args.decision,
+        alert_ids=None if args.all else set(args.alert_id or []),
+        reviewer=args.reviewer,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print("审核决定已写入独立账本；当前模型没有自动变化。")
+    return 0
+
+
+def _replace_output(output: Path, model: dict[str, object], overwrite: bool) -> None:
+    if output.exists() and not overwrite:
+        raise ValueError(f"输出文件已存在: {output}；如需替换请添加 --overwrite")
+    if output.is_symlink():
+        raise ValueError("输出文件不能是符号链接")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    if temporary.exists() or temporary.is_symlink():
+        raise ValueError("临时输出已存在，请先人工检查")
+    try:
+        save_model(model, temporary)
+        LinearModel.load(temporary)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_retrain_feedback(args: argparse.Namespace) -> int:
+    model = build_feedback_model(
+        args.base_csv, args.reviewed,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        max_feedback_fraction=args.max_feedback_fraction,
+    )
+    output = Path(args.output)
+    _replace_output(output, model, args.overwrite)
+    print(json.dumps(model["metadata"], ensure_ascii=False, indent=2))
+    print(f"经人工批准的反馈模型已保存到 {output}；不会自动启用或修改防火墙。")
+    return 0
+
+
+def run_firewall_block(args: argparse.Namespace) -> int:
+    if not args.apply:
+        plan = plan_temporary_block(
+            args.address, args.duration, allowlist_path=args.allowlist,
+        )
+        print(json.dumps({"dry_run": True, "rule": plan}, ensure_ascii=False, indent=2))
+        print("仅生成计划；没有修改 Windows 防火墙。实际执行还需 --apply --confirm APPLY。")
+        return 0
+    result = apply_temporary_block(
+        args.address, args.duration, args.state,
+        allowlist_path=args.allowlist, confirmation=args.confirm,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_firewall_rollback(args: argparse.Namespace) -> int:
+    if not args.apply:
+        print("dry-run：没有修改 Windows 防火墙。实际回滚需 --apply --confirm ROLLBACK。")
+        return 0
+    print(json.dumps(
+        rollback_rules(args.state, confirmation=args.confirm), ensure_ascii=False, indent=2,
+    ))
+    return 0
+
+
+def run_firewall_cleanup(args: argparse.Namespace) -> int:
+    if not args.apply:
+        print("dry-run：没有修改 Windows 防火墙。实际清理需 --apply --confirm CLEANUP。")
+        return 0
+    print(json.dumps(
+        cleanup_expired_rules(args.state, confirmation=args.confirm),
+        ensure_ascii=False, indent=2,
+    ))
+    return 0
+
+
+def run_firewall_kill_switch(args: argparse.Namespace) -> int:
+    print(json.dumps(
+        activate_kill_switch(
+            args.state, rollback=args.rollback, confirmation=args.confirm,
+        ),
+        ensure_ascii=False, indent=2,
+    ))
+    print("kill switch 已启用：后续实际封禁会被拒绝。")
+    return 0
+
+
+def run_firewall_enable(args: argparse.Namespace) -> int:
+    changed = deactivate_kill_switch(args.state, confirmation=args.confirm)
+    print("kill switch 已关闭。" if changed else "kill switch 原本未启用。")
+    return 0
+
+
+def run_generate_signing_key(args: argparse.Namespace) -> int:
+    generate_signing_keys(
+        args.private_key, args.public_key, overwrite=args.overwrite,
+    )
+    print(f"私钥已保存到 {args.private_key}（不得提交）；公钥已保存到 {args.public_key}。")
+    return 0
+
+
+def run_sign_model(args: argparse.Namespace) -> int:
+    manifest = create_signed_bundle(
+        args.model, args.private_key, args.output,
+        version=args.version,
+        min_app_version=args.min_app_version,
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_install_model_update(args: argparse.Namespace) -> int:
+    print(json.dumps(
+        install_signed_bundle(
+            args.bundle, args.public_key, args.target,
+            expected_version=args.expected_version,
+        ),
+        ensure_ascii=False, indent=2,
+    ))
+    return 0
+
+
+def run_rollback_model(args: argparse.Namespace) -> int:
+    print(json.dumps(rollback_model(args.target), ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_performance_test(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    if output.exists() and not args.overwrite:
+        raise ValueError(f"输出文件已存在: {output}；如需替换请添加 --overwrite")
+    if output.is_symlink():
+        raise ValueError("性能报告输出不能是符号链接")
+    report = build_performance_report(
+        _detector(args.model, args.threshold), read_flows(args.input),
+        iterations=args.iterations, warmup=args.warmup,
+        max_p95_ms=args.max_p95_ms, max_peak_mib=args.max_peak_mib,
+    )
+    write_performance_report(report, output)
+    print(json.dumps(report["metrics"], ensure_ascii=False, indent=2))
+    print(f"性能门槛: {'PASS' if report['passed'] else 'FAIL'}；完整报告已写入 {output}")
+    return 0 if report["passed"] else 1
+
+
+def run_baseline_gate(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    if output.exists() and not args.overwrite:
+        raise ValueError(f"输出文件已存在: {output}；如需替换请添加 --overwrite")
+    if output.is_symlink():
+        raise ValueError("基线验收报告输出不能是符号链接")
+    report = evaluate_baseline_gate(
+        args.benchmark_report, args.provenance,
+        min_days=args.min_days,
+        min_benign_rows=args.min_benign_rows,
+        max_fpr=args.max_fpr,
+        max_false_positives_per_day=args.max_false_positives_per_day,
+        min_recall=args.min_recall,
+    )
+    write_gate_report(report, output)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "passed" else 1
+
+
 def run_monitor(args: argparse.Namespace) -> int:
     if args.interval <= 0 or args.duration < 0:
         raise ValueError("interval 必须大于 0，duration 不能小于 0")
@@ -380,6 +648,19 @@ def main(argv: list[str] | None = None) -> int:
         "convert-dataset": run_convert_dataset,
         "compare-models": run_compare_models,
         "dashboard": run_dashboard,
+        "review-feedback": run_review_feedback,
+        "retrain-feedback": run_retrain_feedback,
+        "firewall-block": run_firewall_block,
+        "firewall-rollback": run_firewall_rollback,
+        "firewall-cleanup": run_firewall_cleanup,
+        "firewall-kill-switch": run_firewall_kill_switch,
+        "firewall-enable": run_firewall_enable,
+        "generate-signing-key": run_generate_signing_key,
+        "sign-model": run_sign_model,
+        "install-model-update": run_install_model_update,
+        "rollback-model": run_rollback_model,
+        "performance-test": run_performance_test,
+        "baseline-gate": run_baseline_gate,
     }
     try:
         return actions[args.command](args)

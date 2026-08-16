@@ -95,9 +95,14 @@ $('refresh').addEventListener('click',load);$('severity').addEventListener('chan
 """
 
 
-def _alert_id(alert: dict[str, Any]) -> str:
+def alert_fingerprint(alert: dict[str, Any]) -> str:
     payload = json.dumps(alert, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _alert_id(alert: dict[str, Any]) -> str:
+    """Backward-compatible internal alias for the public fingerprint helper."""
+    return alert_fingerprint(alert)
 
 
 def _search_text(alert: dict[str, Any]) -> str:

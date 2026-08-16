@@ -26,6 +26,7 @@ class DetectionResult:
     top_features: list[dict[str, object]] = field(default_factory=list)
     model_algorithm: str = "unknown"
     model_version: str = "unversioned"
+    feature_snapshot: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -86,4 +87,5 @@ class HybridDetector:
             top_features=self.model.explain(features),
             model_algorithm=self.model.algorithm,
             model_version=self.model.model_version,
+            feature_snapshot={name: round(float(value), 6) for name, value in features.items()},
         )
