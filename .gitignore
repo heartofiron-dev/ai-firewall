@@ -9,6 +9,7 @@ current-connections.jsonl
 *-report.json
 benchmark-report.json
 provenance.json
+lab-report.json
 
 # Captures and converted local traffic must never be committed.
 *.pcap

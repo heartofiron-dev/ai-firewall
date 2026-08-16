@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from ai_firewall.detector import HybridDetector
@@ -49,6 +50,24 @@ class DetectorTests(unittest.TestCase):
             {item["rule_id"] for item in result.rule_evidence},
             {"DATA_SPIKE", "SUSPICIOUS_PORT"},
         )
+
+    def test_suspicious_port_alone_crosses_default_threshold(self):
+        flow = replace(
+            self.flows[0],
+            dst_port=4444,
+            bytes_sent=16,
+            bytes_received=0,
+            packets=5,
+            syn_count=1,
+            rst_count=0,
+            unique_dst_ports_60s=1,
+            connections_60s=1,
+            failed_connections_60s=0,
+        )
+        result = self.detector.analyze(flow)
+        self.assertTrue(result.is_alert)
+        self.assertIn("SUSPICIOUS_PORT", result.rule_ids)
+        self.assertGreaterEqual(result.risk_score, 0.60)
 
     def test_model_only_alert_still_has_structured_explanation(self):
         baseline = self.detector.model

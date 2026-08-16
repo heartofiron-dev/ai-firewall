@@ -27,6 +27,10 @@ from .updates import (
 )
 from .performance import build_performance_report, write_performance_report
 from .baseline_gate import evaluate_baseline_gate, write_gate_report
+from .lab import (
+    LAB_CONFIRMATION, SCENARIOS, run_loopback_lab, validate_lab_report_output,
+    write_lab_report,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +48,17 @@ def build_parser() -> argparse.ArgumentParser:
     demo = sub.add_parser("demo", help="分析仓库自带的安全演示数据")
     demo.add_argument("--model", default=str(DEFAULT_MODEL))
     demo.add_argument("--threshold", type=float, default=0.60)
+
+    lab = sub.add_parser("lab-simulate", help="在 127.0.0.1 上运行有上限的安全 Socket 场景")
+    lab.add_argument("--scenario", choices=("all", *SCENARIOS), default="all")
+    lab.add_argument("--model", default=str(DEFAULT_MODEL))
+    lab.add_argument("--threshold", type=float, default=0.60)
+    lab.add_argument("--output", default="lab-report.json")
+    lab.add_argument("--overwrite", action="store_true")
+    lab.add_argument(
+        "--confirm", default="",
+        help=f"实际产生 loopback 流量前必须为 {LAB_CONFIRMATION}",
+    )
 
     analyze = sub.add_parser("analyze", help="分析 CSV 网络流记录")
     analyze.add_argument("input")
@@ -248,6 +263,37 @@ def run_demo(args: argparse.Namespace) -> int:
         _print_result(result)
     print(f"\n共分析 {len(results)} 条，产生 {sum(r.is_alert for r in results)} 条告警。")
     return 0
+
+
+def run_lab_simulate(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    if output.resolve() == Path(args.model).resolve():
+        raise ValueError("本机实验报告不能覆盖检测模型")
+    validate_lab_report_output(output, overwrite=args.overwrite)
+    print(
+        "本机实验只会连接 127.0.0.1 上由程序自己占用的端口；"
+        "不会抓包、使用真实账户、修改防火墙或访问外部网络。"
+    )
+    report = run_loopback_lab(
+        _detector(args.model, args.threshold),
+        scenario=args.scenario,
+        confirmation=args.confirm,
+    )
+    write_lab_report(report, output, overwrite=args.overwrite)
+    for item in report["scenarios"]:
+        status = str(item["status"]).upper()
+        print(f"[{status:6}] {item['scenario']}")
+        detection = item.get("detection")
+        if isinstance(detection, dict):
+            print(
+                f"         risk={detection['risk_score']:.4f} "
+                f"severity={detection['severity']} rules={detection['rule_ids']}"
+            )
+        elif item.get("error"):
+            print(f"         {item['error']}")
+    print(f"本机实验整体结果: {'PASS' if report['passed'] else 'FAIL'}；报告已写入 {args.output}")
+    print("该结果不能替代跨日真实正常流量误报基线，也不验证 pktmon 抓包链路。")
+    return 0 if report["passed"] else 1
 
 
 def run_analyze(args: argparse.Namespace) -> int:
@@ -638,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     actions = {
         "demo": run_demo,
+        "lab-simulate": run_lab_simulate,
         "analyze": run_analyze,
         "train": run_train,
         "evaluate": run_evaluate,
