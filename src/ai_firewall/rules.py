@@ -29,7 +29,7 @@ def evaluate_rules(flow: FlowRecord) -> list[RuleHit]:
         hits.append(RuleHit("DATA_SPIKE", 0.76, "短时间传输数据量异常增大"))
 
     if flow.dst_port in {4444, 5555, 6667, 31337}:
-        hits.append(RuleHit("SUSPICIOUS_PORT", 0.66, "连接到常见恶意工具或后门端口"))
+        # The 0.90 rule floor must still cross the default 0.60 alert threshold.
+        hits.append(RuleHit("SUSPICIOUS_PORT", 0.67, "连接到常见恶意工具或后门端口"))
 
     return hits
-
