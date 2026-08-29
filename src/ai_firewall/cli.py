@@ -16,6 +16,14 @@ from .windows_capture import capture_with_pktmon
 from .benchmark import build_benchmark_report, write_benchmark_report
 from .datasets import iter_dataset
 from .comparison import build_model_comparison, write_comparison_report
+from .research import (
+    DEFAULT_RESEARCH_SEEDS,
+    DEFAULT_TARGET_FPRS,
+    aggregate_research_reports,
+    build_research_report,
+    write_multiseed_bundle,
+    write_research_bundle,
+)
 from .dashboard import serve_dashboard
 from .feedback import build_feedback_model, review_feedback
 from .firewall import (
@@ -130,6 +138,56 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--seed", type=int, default=42)
     compare.add_argument("--output", default="model-comparison.json")
     compare.add_argument("--overwrite", action="store_true")
+
+    research = sub.add_parser(
+        "research-experiment",
+        help="运行论文用的时间切分、固定误报率和五种检测配置对比",
+    )
+    research.add_argument("input", help="至少 20 条、带标签和 ISO 8601 时间戳的统一 CSV")
+    research.add_argument("--train-fraction", type=float, default=0.5)
+    research.add_argument("--calibration-fraction", type=float, default=0.2)
+    research.add_argument(
+        "--target-fpr", type=float, action="append",
+        help="可重复指定；默认运行 0.005、0.01 和 0.02",
+    )
+    research.add_argument("--seed", type=int, default=42)
+    research.add_argument("--batch-size", type=int, default=256)
+    research.add_argument(
+        "--logistic-epochs", type=int, default=50,
+        help="内置逻辑回归训练轮数；大型论文数据默认 50",
+    )
+    research.add_argument("--with-shap", action="store_true")
+    research.add_argument("--shap-background-size", type=int, default=100)
+    research.add_argument("--shap-summary-size", type=int, default=2000)
+    research.add_argument("--output-dir", default="research-results")
+    research.add_argument("--overwrite", action="store_true")
+
+    multiseed = sub.add_parser(
+        "research-multiseed",
+        help="用固定时间切分运行多随机种子，并自动汇总均值和样本标准差",
+    )
+    multiseed.add_argument("input", help="至少 20 条、带标签和 ISO 8601 时间戳的统一 CSV")
+    multiseed.add_argument("--train-fraction", type=float, default=0.5)
+    multiseed.add_argument("--calibration-fraction", type=float, default=0.2)
+    multiseed.add_argument(
+        "--target-fpr", type=float, action="append",
+        help="可重复指定；默认运行 0.005、0.01 和 0.02",
+    )
+    multiseed.add_argument(
+        "--seed", type=int, action="append",
+        help="可重复指定；默认使用 11、23、42、67 和 89",
+    )
+    multiseed.add_argument("--batch-size", type=int, default=256)
+    multiseed.add_argument("--logistic-epochs", type=int, default=50)
+    multiseed.add_argument("--with-shap", action="store_true")
+    multiseed.add_argument(
+        "--shap-seed", type=int, default=42,
+        help="只在这个代表种子上计算 LightGBM SHAP；默认 42",
+    )
+    multiseed.add_argument("--shap-background-size", type=int, default=100)
+    multiseed.add_argument("--shap-summary-size", type=int, default=2000)
+    multiseed.add_argument("--output-dir", default="research-multiseed-results")
+    multiseed.add_argument("--overwrite", action="store_true")
 
     dashboard = sub.add_parser("dashboard", help="启动只绑定本机的告警与连接仪表盘")
     dashboard.add_argument("--input", default="alerts.jsonl", help="analyze/monitor 生成的 JSONL")
@@ -462,6 +520,86 @@ def run_compare_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_research_experiment(args: argparse.Namespace) -> int:
+    input_path = Path(args.input).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    if output_dir == input_path or input_path in output_dir.parents:
+        raise ValueError("论文实验输出目录不能覆盖输入 CSV")
+    flows = read_flows(input_path)
+    report = build_research_report(
+        flows,
+        train_fraction=args.train_fraction,
+        calibration_fraction=args.calibration_fraction,
+        target_fprs=args.target_fpr or DEFAULT_TARGET_FPRS,
+        seed=args.seed,
+        source=str(input_path),
+        batch_size=args.batch_size,
+        logistic_epochs=args.logistic_epochs,
+        include_shap=args.with_shap,
+        shap_background_size=args.shap_background_size,
+        shap_summary_size=args.shap_summary_size,
+    )
+    outputs = write_research_bundle(report, output_dir, overwrite=args.overwrite)
+    primary = f"{float(report['primary_target_false_positive_rate']):g}"
+    summary = {
+        name: result["operating_points"][primary]["independent_test"]
+        for name, result in report["configurations"].items()
+    }
+    print(json.dumps({
+        "primary_target_fpr": report["primary_target_false_positive_rate"],
+        "ranking": report["ranking_at_primary_target"],
+        "configurations": summary,
+    }, ensure_ascii=False, indent=2))
+    print("论文实验文件已写入：")
+    for output in outputs:
+        print(f"- {output}")
+    return 0
+
+
+def run_research_multiseed(args: argparse.Namespace) -> int:
+    input_path = Path(args.input).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    if output_dir == input_path or input_path in output_dir.parents:
+        raise ValueError("论文实验输出目录不能覆盖输入 CSV")
+    seeds = tuple(sorted(set(args.seed or DEFAULT_RESEARCH_SEEDS)))
+    if len(seeds) < 2:
+        raise ValueError("多随机种子实验至少需要两个不同 seed")
+    if args.with_shap and args.shap_seed not in seeds:
+        raise ValueError("--shap-seed 必须同时出现在 --seed 列表中")
+    flows = read_flows(input_path)
+    reports = []
+    for seed in seeds:
+        print(f"运行 seed={seed}{' + SHAP' if args.with_shap and seed == args.shap_seed else ''} ...")
+        report = build_research_report(
+            flows,
+            train_fraction=args.train_fraction,
+            calibration_fraction=args.calibration_fraction,
+            target_fprs=args.target_fpr or DEFAULT_TARGET_FPRS,
+            seed=seed,
+            source=str(input_path),
+            batch_size=args.batch_size,
+            logistic_epochs=args.logistic_epochs,
+            include_shap=args.with_shap and seed == args.shap_seed,
+            shap_background_size=args.shap_background_size,
+            shap_summary_size=args.shap_summary_size,
+        )
+        write_research_bundle(
+            report, output_dir / f"seed-{seed}", overwrite=args.overwrite,
+        )
+        reports.append(report)
+    aggregate = aggregate_research_reports(reports)
+    outputs = write_multiseed_bundle(aggregate, output_dir, overwrite=args.overwrite)
+    print(json.dumps({
+        "seeds": aggregate["seeds"],
+        "source": aggregate["source"],
+        "primary_target_fpr": aggregate["primary_target_false_positive_rate"],
+    }, ensure_ascii=False, indent=2))
+    print("多随机种子汇总文件已写入：")
+    for output in outputs:
+        print(f"- {output}")
+    return 0
+
+
 def run_dashboard(args: argparse.Namespace) -> int:
     serve_dashboard(
         args.input, args.feedback, port=args.port, max_alerts=args.max_alerts,
@@ -694,6 +832,8 @@ def main(argv: list[str] | None = None) -> int:
         "benchmark": run_benchmark,
         "convert-dataset": run_convert_dataset,
         "compare-models": run_compare_models,
+        "research-experiment": run_research_experiment,
+        "research-multiseed": run_research_multiseed,
         "dashboard": run_dashboard,
         "review-feedback": run_review_feedback,
         "retrain-feedback": run_retrain_feedback,
