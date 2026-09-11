@@ -1,12 +1,8 @@
-# AI Firewall（AI 防火墙）
-
-[![tests](https://github.com/heartofiron-dev/ai-firewall/actions/workflows/tests.yml/badge.svg)](https://github.com/heartofiron-dev/ai-firewall/actions/workflows/tests.yml)
+# AI Firewall
 
 这是我做的一个本地网络安全项目。
 
-我最开始的想法其实很直接：Windows 会产生大量网络连接，但普通用户很难看懂“哪个连接只是正常联网，哪个连接可能值得警惕”。传统安全工具往往只给一个结论，我想做一个能够把判断过程说清楚的检测器——它为什么报警、命中了什么规则、哪些特征推高了风险，都应该能查到。
-
-所以我把项目叫作 **AI Firewall**。定位是一个 **Explainable AI Network Monitor（可解释 AI 网络监控器）**，不是可以代替 Windows Defender、Zeek、Suricata 或企业 SIEM 的生产级防火墙。
+Windows 会产生大量网络连接，但普通用户很难看懂“哪个连接只是正常联网，哪个连接可能值得警惕”。传统安全工具往往只给一个结论，我想做一个能够把判断过程说清楚的检测器——它为什么报警、命中了什么规则、哪些特征推高了风险，都应该能查到。
 
 当前版本：`1.2.0`
 
@@ -25,11 +21,11 @@
 - 验证 Ed25519 签名的模型更新包，并保留回滚版本；
 - 在 `127.0.0.1` 上运行六种有上限的安全 Socket 实验。
 
-默认情况下，项目只做观察和告警。它不会偷偷上传网络记录，不会自动训练，也不会因为一次模型判断就自动封禁地址。
+默认情况下，只做观察和告警，不会偷偷上传网络记录，不会自动训练，也不会因为一次模型判断就自动封禁地址。
 
-## 最快的体验方式
+## 体验方式
 
-要求 Python 3.10 或更高版本。核心功能没有第三方运行依赖。
+要求 Python 3.10 或更高版本。没有第三方运行依赖。
 
 ```powershell
 git clone https://github.com/heartofiron-dev/ai-firewall.git
@@ -69,7 +65,7 @@ risk = max(0.70 * model_score + 0.30 * rule_score,
 
 第二项是规则保底：如果一条强规则已经命中，不会因为模型没见过这种情况就把它完全压下去。
 
-这里所谓的“AI”不是一个不可解释的大模型，而是一个小型统计模型。每条告警都会保留贡献最大的特征和具体规则证据。我更看重“为什么得出这个结果”，而不只是输出一个看起来很聪明的分数。
+这里所谓的“AI”不是一个大模型，而是一个小型统计模型。每条告警都会保留贡献最大的特征和具体规则证据。我更看重“为什么得出这个结果”，而不只是输出一个看起来很聪明的分数。
 
 ## 当前能识别的五类行为
 
@@ -147,7 +143,7 @@ ai-firewall lab-simulate --confirm LOCAL-LAB --output lab-report.json
 
 实验只允许访问 `127.0.0.1`，而且只能连接程序自己刚刚占用的临时端口。它会模拟正常访问、扫描形态、认证拒绝、连接突增、数据突增和可疑端口六种场景，但不会扫描局域网或公网，也不会使用真实密码、漏洞利用或恶意载荷。
 
-我自己电脑上的一次脱敏结果记录在 [`docs/loopback-lab-results-v1.1.0.md`](docs/loopback-lab-results-v1.1.0.md)。这只能证明本机实验链路能工作，不能证明模型已经通过真实企业网络验收。
+我自己电脑上的一次脱敏结果记录在 [`docs/loopback-lab-results-v1.1.0.md`](docs/loopback-lab-results-v1.1.0.md)。这只能证明本机实验链路能工作。
 
 ## 训练和评估
 
@@ -171,17 +167,18 @@ ai-firewall compare-models labeled-flows.csv --output model-comparison.json
 
 ### 论文复现实验
 
-仓库现在还包含论文用的多随机种子实验入口。它会固定数据样本和时间切分，用 11、23、42、67、89 五个种子重复运行，在 0.5%、1% 和 2% 目标误报率下汇总均值与样本标准差；代表种子 42 可额外为 LightGBM 生成 Tree SHAP 全局图和逐告警解释。
+仓库现在还包含论文用的多随机种子实验入口。它会把相同时间戳保留在同一侧，建立严格时间边界；LightGBM 可仅在外层训练段内执行 36 组嵌套时间顺序网格搜索。胜出参数固定后，再用 11、23、42、67、89 五个种子重复运行，并在 0.5%、1% 和 2% 目标误报率下汇总均值与样本标准差；代表种子 42 可额外生成 Tree SHAP 全局图和逐告警解释。
 
 ```powershell
 python -m pip install -e ".[comparison,explainability]"
 ai-firewall research-multiseed converted-dataset.csv `
   --seed 11 --seed 23 --seed 42 --seed 67 --seed 89 `
+  --lightgbm-grid-search `
   --with-shap --shap-seed 42 --shap-background-size 100 `
   --output-dir research-multiseed-results
 ```
 
-实验协议与当前结果分别记录在 [`docs/paper-experiment-protocol.md`](docs/paper-experiment-protocol.md) 和 [`docs/research-results-2026-08-28.md`](docs/research-results-2026-08-28.md)。这组结果来自 CICIDS2017 与 UNSW-NB15 的公开数据样本，说明不同模型在时间漂移、误报控制和解释能力之间存在取舍；它不能代替真实目标网络的外部验收。SHAP 只解释当前 LightGBM 如何形成预测，不代表特征与攻击之间存在因果关系。
+实验协议与当前结果分别记录在 [`docs/paper-experiment-protocol.md`](docs/paper-experiment-protocol.md) 和 [`docs/research-results-2026-09-05.md`](docs/research-results-2026-09-05.md)。这组结果来自 CICIDS2017 与 UNSW-NB15 的公开数据样本，说明不同模型在时间漂移、误报控制和解释能力之间存在取舍；它不能代替真实目标网络的外部验收。SHAP 只解释当前 LightGBM 如何形成预测，不代表特征与攻击之间存在因果关系。
 
 仓库还提供：
 
@@ -215,8 +212,6 @@ ai-firewall firewall-block 8.8.8.8 --duration 600
 
 核心分析都在本机完成。项目不会主动上传 CSV、PCAP、告警、反馈或模型。
 
-但“本地处理”不代表数据就不敏感：IP、域名、进程、时间戳和连接模式仍可能暴露个人或组织信息。真实日志、原始抓包、API key、Cookie、密码、签名私钥和未审查的性能报告都不应该提交到 GitHub。
-
 ## 怎么测试
 
 安装全部可选测试依赖后运行：
@@ -226,9 +221,9 @@ python -m pip install -e ".[comparison,explainability,updates]"
 python -m unittest discover -s tests -v
 ```
 
-当前本地完整运行结果为 66 项通过、2 项因缺少可选 `cryptography` 依赖而跳过。测试覆盖检测规则、模型训练、PCAP/PCAPNG、IPv6、Windows 连接监控、数据集转换、五随机种子汇总、SHAP 输出、仪表盘、反馈审核、防火墙安全边界、签名更新、性能报告和本机实验。
+当前本地完整运行结果为 66 项通过。测试覆盖检测规则、模型训练、PCAP/PCAPNG、IPv6、Windows 连接监控、数据集转换、五随机种子汇总、SHAP 输出、仪表盘、反馈审核、防火墙安全边界、签名更新、性能报告和本机实验。
 
-我认为真正重要的验收不是“样例 accuracy 很高”，而是：在已经授权、脱敏、跨多个日期、从未参与训练的数据上，误报和漏报是否仍然可接受。仓库已经有 `benchmark` 和 `baseline-gate` 工具，但没有公开真实私人网络数据，也没有声称真实环境门槛已经通过。
+我觉得真正重要的验收不是“样例 accuracy 很高”，而是：在已经授权、脱敏、跨多个日期、从未参与训练的数据上，误报和漏报是否仍然可接受。仓库已经有 `benchmark` 和 `baseline-gate` 工具，但没有公开真实私人网络数据。
 
 ## 项目结构
 
@@ -253,27 +248,14 @@ ai-firewall/
 └── README.md
 ```
 
-## 目前还缺什么
+## 目前问题之处
 
-- 还没有用公开仓库无法提供的长期真实个人/企业流量完成外部验收；
-- Windows 实时连接表不是完整抓包，可能看不到非常短的连接和准确字节数；
-- 规则和模型都可能误报，不能把风险分数当作攻击证据；
-- 反馈训练仍要求人工审核，不能完全自动化；
-- 防火墙响应没有在这次公开发布中对真实日常电脑做自动化执行验证；
+- Windows 实时连接表不是完整抓包，可能看不到非常短的连接和准确字节数。
+- 规则和模型都可能误报。
 - 这个项目不包含漏洞修复、恶意软件清除或完整终端防护能力。
 
-接下来真正值得做的，不是继续堆很多听起来厉害的功能，而是收集经过授权和脱敏的跨日基线，在不同 Windows 设备上记录每日误报、漏报、CPU 占用和延迟，再根据结果调整模型和阈值。
-
-## 安全边界
-
-- 只监控你拥有或明确获准测试的设备与网络；
-- 不要修改 loopback 实验去扫描其他目标；
-- 不要把演示数据结果包装成真实防护能力；
-- 不要把特征贡献解释成攻击因果证明；
-- 不要未经人工确认就把反馈混入训练数据；
-- 不要因为模型分数高就直接封禁地址；
-- 如果需要报告安全问题，请阅读 [SECURITY.md](SECURITY.md)。
+## 安全问题
+- [SECURITY.md](SECURITY.md)。
 
 ## License
-
-MIT License，详见 [LICENSE](LICENSE)。
+[LICENSE](LICENSE)。

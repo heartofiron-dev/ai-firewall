@@ -21,6 +21,8 @@ from .research import (
     DEFAULT_TARGET_FPRS,
     aggregate_research_reports,
     build_research_report,
+    grid_search_lightgbm,
+    write_lightgbm_grid_search_bundle,
     write_multiseed_bundle,
     write_research_bundle,
 )
@@ -49,15 +51,15 @@ DEFAULT_SAMPLE = PROJECT_ROOT / "data" / "sample_flows.csv"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-firewall",
-        description="AI 防火墙 MVP：离线分析、训练与评估网络流记录。",
+        description="用于网络流检测、模型训练和评估的命令行工具。",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    demo = sub.add_parser("demo", help="分析仓库自带的安全演示数据")
+    demo = sub.add_parser("demo", help="分析仓库附带的演示数据")
     demo.add_argument("--model", default=str(DEFAULT_MODEL))
     demo.add_argument("--threshold", type=float, default=0.60)
 
-    lab = sub.add_parser("lab-simulate", help="在 127.0.0.1 上运行有上限的安全 Socket 场景")
+    lab = sub.add_parser("lab-simulate", help="在 127.0.0.1 上运行受控 Socket 测试")
     lab.add_argument("--scenario", choices=("all", *SCENARIOS), default="all")
     lab.add_argument("--model", default=str(DEFAULT_MODEL))
     lab.add_argument("--threshold", type=float, default=0.60)
@@ -159,6 +161,10 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--with-shap", action="store_true")
     research.add_argument("--shap-background-size", type=int, default=100)
     research.add_argument("--shap-summary-size", type=int, default=2000)
+    research.add_argument(
+        "--lightgbm-grid-search", action="store_true",
+        help="仅在外层训练时段内执行 36 组嵌套时间顺序网格搜索",
+    )
     research.add_argument("--output-dir", default="research-results")
     research.add_argument("--overwrite", action="store_true")
 
@@ -186,10 +192,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     multiseed.add_argument("--shap-background-size", type=int, default=100)
     multiseed.add_argument("--shap-summary-size", type=int, default=2000)
+    multiseed.add_argument(
+        "--lightgbm-grid-search", action="store_true",
+        help="每个数据集只搜索一次，再将胜出参数固定用于全部 seed",
+    )
     multiseed.add_argument("--output-dir", default="research-multiseed-results")
     multiseed.add_argument("--overwrite", action="store_true")
 
-    dashboard = sub.add_parser("dashboard", help="启动只绑定本机的告警与连接仪表盘")
+    dashboard = sub.add_parser("dashboard", help="启动仅监听本机地址的连接与告警页面")
     dashboard.add_argument("--input", default="alerts.jsonl", help="analyze/monitor 生成的 JSONL")
     dashboard.add_argument("--feedback", default="feedback/pending.jsonl", help="独立误报审核队列")
     dashboard.add_argument("--port", type=int, default=8765)
@@ -274,7 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     perf.add_argument("--output", default="performance-report.json")
     perf.add_argument("--overwrite", action="store_true")
 
-    gate = sub.add_parser("baseline-gate", help="审核真实环境误报基线是否达到发布门槛")
+    gate = sub.add_parser("baseline-gate", help="检查真实环境误报基线是否达到发布门槛")
     gate.add_argument("benchmark_report")
     gate.add_argument("provenance", help="授权、脱敏和独立留出声明 JSON")
     gate.add_argument("--min-days", type=int, default=3)
@@ -526,6 +536,17 @@ def run_research_experiment(args: argparse.Namespace) -> int:
     if output_dir == input_path or input_path in output_dir.parents:
         raise ValueError("论文实验输出目录不能覆盖输入 CSV")
     flows = read_flows(input_path)
+    lightgbm_tuning = None
+    if args.lightgbm_grid_search:
+        print("在外层训练时段内执行 LightGBM 嵌套时间顺序网格搜索 ...")
+        lightgbm_tuning = grid_search_lightgbm(
+            flows,
+            train_fraction=args.train_fraction,
+            calibration_fraction=args.calibration_fraction,
+            target_fpr=0.01,
+            seed=42,
+            source=str(input_path),
+        )
     report = build_research_report(
         flows,
         train_fraction=args.train_fraction,
@@ -538,8 +559,13 @@ def run_research_experiment(args: argparse.Namespace) -> int:
         include_shap=args.with_shap,
         shap_background_size=args.shap_background_size,
         shap_summary_size=args.shap_summary_size,
+        lightgbm_tuning=lightgbm_tuning,
     )
     outputs = write_research_bundle(report, output_dir, overwrite=args.overwrite)
+    if lightgbm_tuning:
+        outputs.extend(write_lightgbm_grid_search_bundle(
+            lightgbm_tuning, output_dir, overwrite=args.overwrite,
+        ))
     primary = f"{float(report['primary_target_false_positive_rate']):g}"
     summary = {
         name: result["operating_points"][primary]["independent_test"]
@@ -567,6 +593,23 @@ def run_research_multiseed(args: argparse.Namespace) -> int:
     if args.with_shap and args.shap_seed not in seeds:
         raise ValueError("--shap-seed 必须同时出现在 --seed 列表中")
     flows = read_flows(input_path)
+    lightgbm_tuning = None
+    if args.lightgbm_grid_search:
+        print("先在外层训练时段内执行一次 LightGBM 嵌套时间顺序网格搜索 ...")
+        lightgbm_tuning = grid_search_lightgbm(
+            flows,
+            train_fraction=args.train_fraction,
+            calibration_fraction=args.calibration_fraction,
+            target_fpr=0.01,
+            seed=42,
+            source=str(input_path),
+        )
+        print(json.dumps({
+            "selected_lightgbm_params": lightgbm_tuning["best_params"],
+            "selection_constraint_met": lightgbm_tuning[
+                "selection_constraint_met"
+            ],
+        }, ensure_ascii=False, indent=2))
     reports = []
     for seed in seeds:
         print(f"运行 seed={seed}{' + SHAP' if args.with_shap and seed == args.shap_seed else ''} ...")
@@ -582,6 +625,7 @@ def run_research_multiseed(args: argparse.Namespace) -> int:
             include_shap=args.with_shap and seed == args.shap_seed,
             shap_background_size=args.shap_background_size,
             shap_summary_size=args.shap_summary_size,
+            lightgbm_tuning=lightgbm_tuning,
         )
         write_research_bundle(
             report, output_dir / f"seed-{seed}", overwrite=args.overwrite,
@@ -813,8 +857,8 @@ def run_monitor(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Windows terminals may inherit a legacy encoding. Keep Chinese explanations
-    # readable and prevent one unsupported character from aborting analysis.
+    # Force UTF-8 output because some Windows terminals still default to a legacy
+    # code page and may otherwise fail while printing Chinese messages.
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:

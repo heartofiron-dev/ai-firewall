@@ -1,6 +1,6 @@
 # Five-seed public-dataset results — 2026-08-28
 
-These are reproducible pre-paper results on fixed chronological samples, not production claims. The experiment used the same 50% train / 20% calibration / 30% independent-test split in every run. Thresholds were calibrated only on benign calibration rows at target false-positive rates (FPRs) of 0.5%, 1%, and 2%.
+These results use fixed chronological samples from two public datasets; they do not measure production performance. Every run used the same 50% train / 20% calibration / 30% independent-test split. Thresholds were calibrated only on benign calibration rows at target false-positive rates (FPRs) of 0.5%, 1%, and 2%.
 
 ## Data
 
@@ -41,14 +41,14 @@ Tree SHAP was run for LightGBM on representative seed 42 using 100 benign calibr
 
 SHAP attributes the fitted model's prediction to its inputs. It does not show that a feature caused an attack, and it does not turn the detector into an automatic blocking decision.
 
-## Interpretation boundary
+## Limitations
 
 - No configuration dominates both datasets.
-- LightGBM is strong and stable on UNSW-NB15, but its CICIDS2017 independent-test FPR rises to 6.28% after calibration to a 1% target.
-- Logistic regression and the hybrid configuration are competitive on CICIDS2017, but their attack recall collapses on UNSW-NB15 and varies across seeds.
+- LightGBM reaches 92.51% recall at 1.03% FPR on UNSW-NB15, but its CICIDS2017 independent-test FPR rises to 6.28% after calibration to a 1% target.
+- Logistic regression and the hybrid configuration have higher recall on CICIDS2017 than on UNSW-NB15, where recall falls below 3% and varies across seeds.
 - Rule-only does not transfer to these converted samples because the required rule triggers are absent or not preserved in the benchmark fields.
 - Five seeds do not replace rolling-window or cross-dataset evaluation; the time split remained fixed.
 - Public IDS benchmarks cannot establish real-network or production performance.
 
-The supported paper claim is therefore a **performance–explainability–temporal-robustness trade-off in hybrid network intrusion detection**, not a universally superior model or a production-ready firewall.
+These results support a paper on the **performance–explainability–temporal-robustness trade-off in hybrid network intrusion detection**. They do not establish a universally superior model or a production-ready firewall.
 

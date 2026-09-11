@@ -33,18 +33,18 @@ _INDEX_HTML = """<!doctype html>
 <body>
   <header>
     <div>
-      <p class="eyebrow">LOCAL-ONLY DETECTION</p>
+      <p class="eyebrow">本机告警记录</p>
       <h1>AI Firewall</h1>
-      <p class="subtitle">连接与告警仪表盘 · 仅分析，不自动拦截</p>
+      <p class="subtitle">查看连接、模型分数和规则命中；本页不执行拦截</p>
     </div>
     <div class="live"><span></span><strong id="status">正在连接</strong></div>
   </header>
   <main>
     <section class="metrics" aria-label="概览">
-      <article><span>当前记录</span><strong id="total">0</strong></article>
+      <article><span>显示记录</span><strong id="total">0</strong></article>
       <article><span>严重告警</span><strong id="critical">0</strong></article>
-      <article><span>已标误报</span><strong id="feedback">0</strong></article>
-      <article><span>跳过坏行</span><strong id="skipped">0</strong></article>
+      <article><span>已提交误报</span><strong id="feedback">0</strong></article>
+      <article><span>无法解析的行</span><strong id="skipped">0</strong></article>
     </section>
     <section class="panel controls" aria-label="筛选">
       <label>严重级别
@@ -63,14 +63,14 @@ _INDEX_HTML = """<!doctype html>
       <div class="table-title"><h2>连接与告警</h2><small id="updated">尚未刷新</small></div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>时间 / 级别</th><th>连接</th><th>进程 / 方向</th><th>风险与证据</th><th>人工标记</th></tr></thead>
+          <thead><tr><th>时间 / 级别</th><th>连接</th><th>进程 / 方向</th><th>分数与原因</th><th>人工标记</th></tr></thead>
           <tbody id="rows"></tbody>
         </table>
       </div>
-      <p id="empty" class="empty">暂无匹配记录。可以先运行 analyze，或让 monitor 写入同一个 JSONL。</p>
+      <p id="empty" class="empty">没有符合当前筛选条件的记录。请先运行 analyze，或让 monitor 写入同一个 JSONL 文件。</p>
     </section>
   </main>
-  <footer>数据只从本机 JSONL 读取；误报标记进入独立审核队列，不会自动训练或修改防火墙。</footer>
+  <footer>本页只读取本机 JSONL 文件。误报标记进入待审核队列，不会触发训练或修改防火墙。</footer>
   <script src="/app.js" defer></script>
 </body>
 </html>
@@ -224,8 +224,8 @@ class DashboardState:
 
 
 class DashboardServer(HTTPServer):
-    # On Windows SO_REUSEADDR can let two processes accept the same port,
-    # making the UI origin ambiguous. Fail closed when the port is occupied.
+    # Keep address reuse disabled on Windows so startup fails if another process
+    # already owns the dashboard port.
     allow_reuse_address = False
 
     def __init__(self, address: tuple[str, int], state: DashboardState, token: str | None = None):

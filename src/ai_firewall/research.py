@@ -6,6 +6,7 @@ import math
 import time
 from datetime import datetime, timezone
 from html import escape
+from itertools import product
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -13,6 +14,7 @@ from .comparison import (
     _calibrate_threshold,
     _linear_model,
     _matrix,
+    _timestamp,
     chronological_model_split,
 )
 from .features import FEATURE_NAMES
@@ -23,6 +25,12 @@ from .training import label_to_int, train_logistic_model
 
 DEFAULT_TARGET_FPRS = (0.005, 0.01, 0.02)
 DEFAULT_RESEARCH_SEEDS = (11, 23, 42, 67, 89)
+DEFAULT_LIGHTGBM_GRID = {
+    "n_estimators": (100, 200, 400),
+    "learning_rate": (0.03, 0.05, 0.10),
+    "num_leaves": (15, 31),
+    "min_child_samples": (20, 50),
+}
 
 
 def _average_precision(scores: Sequence[float], labels: Sequence[int]) -> float:
@@ -392,6 +400,282 @@ def _evaluate_configuration(
     }
 
 
+def _strict_inner_boundary(
+    flows: Sequence[FlowRecord], boundary: int, minimum: int,
+) -> int:
+    """Move a boundary left so equal timestamps cannot occur on both sides."""
+    timestamps = [_timestamp(flow.timestamp) for flow in flows]
+    while boundary > minimum and timestamps[boundary - 1] == timestamps[boundary]:
+        boundary -= 1
+    if boundary <= minimum or timestamps[boundary - 1] >= timestamps[boundary]:
+        raise ValueError("内部时间戳分组过大，无法建立严格分离的网格搜索区间")
+    return boundary
+
+
+def _normalise_lightgbm_grid(
+    grid: dict[str, Sequence[int | float]] | None,
+) -> dict[str, tuple[int | float, ...]]:
+    supplied = grid or DEFAULT_LIGHTGBM_GRID
+    expected = set(DEFAULT_LIGHTGBM_GRID)
+    if set(supplied) != expected:
+        raise ValueError(
+            "LightGBM 网格必须且只能包含 n_estimators、learning_rate、"
+            "num_leaves 和 min_child_samples"
+        )
+    normalized: dict[str, tuple[int | float, ...]] = {}
+    for name, defaults in DEFAULT_LIGHTGBM_GRID.items():
+        values = tuple(sorted(set(supplied[name])))
+        if not values:
+            raise ValueError(f"LightGBM 网格 {name} 不能为空")
+        if any(float(value) <= 0 for value in values):
+            raise ValueError(f"LightGBM 网格 {name} 必须全部大于 0")
+        if isinstance(defaults[0], int):
+            if any(float(value) != int(value) for value in values):
+                raise ValueError(f"LightGBM 网格 {name} 必须使用整数")
+            normalized[name] = tuple(int(value) for value in values)
+        else:
+            normalized[name] = tuple(float(value) for value in values)
+    return normalized
+
+
+def grid_search_lightgbm(
+    flows: list[FlowRecord], *, train_fraction: float = 0.5,
+    calibration_fraction: float = 0.2, target_fpr: float = 0.01,
+    seed: int = 42,
+    grid: dict[str, Sequence[int | float]] | None = None,
+    source: str | None = None,
+) -> dict[str, object]:
+    """Tune LightGBM inside the outer training period without touching its test data."""
+    try:
+        import lightgbm
+        from lightgbm import LGBMClassifier
+    except ImportError as exc:
+        raise ValueError(
+            "LightGBM 网格搜索需要 LightGBM；请安装 comparison 可选依赖"
+        ) from exc
+    if not 0.0 <= target_fpr <= 0.5:
+        raise ValueError("网格搜索目标 FPR 必须在 0 和 0.5 之间")
+
+    normalized_grid = _normalise_lightgbm_grid(grid)
+    outer = chronological_model_split(flows, train_fraction, calibration_fraction)
+    outer_train = outer.train
+    fit_end = max(1, min(len(outer_train) - 2, math.floor(len(outer_train) * 0.60)))
+    fit_end = _strict_inner_boundary(outer_train, fit_end, 0)
+    calibration_end = max(
+        fit_end + 1,
+        min(len(outer_train) - 1, math.floor(len(outer_train) * 0.80)),
+    )
+    calibration_end = _strict_inner_boundary(
+        outer_train, calibration_end, fit_end,
+    )
+    inner_fit = outer_train[:fit_end]
+    inner_calibration = outer_train[fit_end:calibration_end]
+    inner_validation = outer_train[calibration_end:]
+
+    fit_labels = [label_to_int(flow.label) for flow in inner_fit]
+    calibration_labels = [label_to_int(flow.label) for flow in inner_calibration]
+    validation_labels = [label_to_int(flow.label) for flow in inner_validation]
+    if set(fit_labels) != {0, 1}:
+        raise ValueError("网格搜索内部拟合区间必须同时包含正常和攻击样本")
+    if 0 not in calibration_labels:
+        raise ValueError("网格搜索内部校准区间必须包含正常样本")
+    if set(validation_labels) != {0, 1}:
+        raise ValueError("网格搜索内部验证区间必须同时包含正常和攻击样本")
+
+    fit_matrix = _matrix(inner_fit)
+    calibration_matrix = _matrix(inner_calibration)
+    validation_matrix = _matrix(inner_validation)
+    candidates: list[dict[str, object]] = []
+    combinations = product(
+        normalized_grid["n_estimators"],
+        normalized_grid["learning_rate"],
+        normalized_grid["num_leaves"],
+        normalized_grid["min_child_samples"],
+    )
+    for n_estimators, learning_rate, num_leaves, min_child_samples in combinations:
+        parameters = {
+            "n_estimators": int(n_estimators),
+            "learning_rate": float(learning_rate),
+            "num_leaves": int(num_leaves),
+            "min_child_samples": int(min_child_samples),
+        }
+        started = time.perf_counter()
+        try:
+            model = LGBMClassifier(
+                objective="binary",
+                random_state=seed,
+                n_jobs=1,
+                verbosity=-1,
+                deterministic=True,
+                force_col_wise=True,
+                subsample=1.0,
+                colsample_bytree=1.0,
+                **parameters,
+            )
+            model.fit(fit_matrix, fit_labels)
+            calibration_scores = [
+                float(row[1]) for row in model.predict_proba(calibration_matrix)
+            ]
+            validation_scores = [
+                float(row[1]) for row in model.predict_proba(validation_matrix)
+            ]
+            if not all(
+                math.isfinite(value)
+                for value in calibration_scores + validation_scores
+            ):
+                raise ValueError("候选模型产生了 NaN 或 Infinity 分数")
+            benign_calibration_scores = [
+                score for score, label in zip(calibration_scores, calibration_labels)
+                if label == 0
+            ]
+            calibration = _calibrate_threshold(
+                benign_calibration_scores, target_fpr,
+            )
+            validation = _metrics(
+                validation_scores,
+                validation_labels,
+                float(calibration["threshold"]),
+                [False] * len(validation_labels),
+            )
+            validation_fpr = float(validation["false_positive_rate"])
+            candidates.append({
+                **parameters,
+                "status": "ok",
+                "fit_seconds": round(time.perf_counter() - started, 6),
+                "threshold": float(calibration["threshold"]),
+                "inner_calibration_fpr": calibration[
+                    "calibration_false_positive_rate"
+                ],
+                "validation_fpr": validation_fpr,
+                "validation_precision": validation["precision"],
+                "validation_recall": validation["recall"],
+                "validation_f1": validation["f1"],
+                "validation_auprc": round(
+                    _average_precision(validation_scores, validation_labels), 6,
+                ),
+                "constraint_met": validation_fpr <= target_fpr + 1e-12,
+            })
+        except (ValueError, OverflowError, FloatingPointError) as exc:
+            candidates.append({
+                **parameters,
+                "status": "infeasible",
+                "fit_seconds": round(time.perf_counter() - started, 6),
+                "error": str(exc),
+                "constraint_met": False,
+            })
+
+    valid = [candidate for candidate in candidates if candidate["status"] == "ok"]
+    if not valid:
+        raise ValueError("所有 LightGBM 网格候选均不可用，未选择参数")
+    feasible = [candidate for candidate in valid if candidate["constraint_met"]]
+
+    def complexity_key(candidate: dict[str, object]) -> tuple[float, ...]:
+        return (
+            float(candidate["n_estimators"]) * float(candidate["num_leaves"]),
+            -float(candidate["min_child_samples"]),
+            float(candidate["learning_rate"]),
+            float(candidate["n_estimators"]),
+            float(candidate["num_leaves"]),
+        )
+
+    if feasible:
+        selected = min(
+            feasible,
+            key=lambda candidate: (
+                -float(candidate["validation_recall"]),
+                -float(candidate["validation_auprc"]),
+                *complexity_key(candidate),
+            ),
+        )
+        selection_constraint_met = True
+        selection_rule = (
+            "maximum validation recall among candidates with validation FPR <= target; "
+            "ties use higher AUPRC, then lower complexity"
+        )
+    else:
+        selected = min(
+            valid,
+            key=lambda candidate: (
+                float(candidate["validation_fpr"]) - target_fpr,
+                -float(candidate["validation_recall"]),
+                -float(candidate["validation_auprc"]),
+                *complexity_key(candidate),
+            ),
+        )
+        selection_constraint_met = False
+        selection_rule = (
+            "no candidate met the validation-FPR constraint; selected minimum FPR "
+            "overshoot, then higher recall, higher AUPRC, and lower complexity"
+        )
+
+    best_params = {
+        name: selected[name]
+        for name in (
+            "n_estimators", "learning_rate", "num_leaves", "min_child_samples"
+        )
+    }
+    warning = None
+    if not selection_constraint_met:
+        warning = (
+            "No candidate met the inner-validation FPR target; the selected fallback "
+            "must not be described as satisfying the 1% constraint."
+        )
+    return {
+        "schema_version": "1.0",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "method": "exhaustive_nested_chronological_grid_search",
+        "library": {"name": "lightgbm", "version": lightgbm.__version__},
+        "seed": seed,
+        "target_false_positive_rate": target_fpr,
+        "outer_split_access": {
+            "training_rows_used": len(outer.train),
+            "calibration_rows_reserved": len(outer.calibration),
+            "test_rows_reserved": len(outer.test),
+            "algorithmic_search_accessed_outer_calibration": False,
+            "algorithmic_search_accessed_outer_test": False,
+        },
+        "inner_split": {
+            "fit_rows": len(inner_fit),
+            "calibration_rows": len(inner_calibration),
+            "validation_rows": len(inner_validation),
+            "fit_attack_rows": fit_labels.count(1),
+            "calibration_benign_rows": calibration_labels.count(0),
+            "validation_benign_rows": validation_labels.count(0),
+            "validation_attack_rows": validation_labels.count(1),
+            "fit_ends_at": inner_fit[-1].timestamp,
+            "calibration_starts_at": inner_calibration[0].timestamp,
+            "calibration_ends_at": inner_calibration[-1].timestamp,
+            "validation_starts_at": inner_validation[0].timestamp,
+        },
+        "fixed_parameters": {
+            "objective": "binary",
+            "n_jobs": 1,
+            "verbosity": -1,
+            "deterministic": True,
+            "force_col_wise": True,
+            "subsample": 1.0,
+            "colsample_bytree": 1.0,
+        },
+        "grid": {name: list(values) for name, values in normalized_grid.items()},
+        "candidate_count": len(candidates),
+        "valid_candidate_count": len(valid),
+        "feasible_candidate_count": len(feasible),
+        "selection_rule": selection_rule,
+        "selection_constraint_met": selection_constraint_met,
+        "best_params": best_params,
+        "best_validation": {
+            name: selected[name]
+            for name in (
+                "validation_fpr", "validation_precision", "validation_recall",
+                "validation_f1", "validation_auprc", "threshold",
+            )
+        },
+        "candidates": candidates,
+        "warning": warning,
+    }
+
+
 def build_research_report(
     flows: list[FlowRecord], *, train_fraction: float = 0.5,
     calibration_fraction: float = 0.2,
@@ -399,6 +683,8 @@ def build_research_report(
     seed: int = 42, source: str | None = None, batch_size: int = 256,
     logistic_epochs: int = 50, include_shap: bool = False,
     shap_background_size: int = 100, shap_summary_size: int = 2000,
+    lightgbm_params: dict[str, int | float] | None = None,
+    lightgbm_tuning: dict[str, object] | None = None,
 ) -> dict[str, object]:
     try:
         import sklearn
@@ -426,6 +712,39 @@ def build_research_report(
             raise ValueError("目标误报率必须在 0 和 0.5 之间")
 
     split = chronological_model_split(flows, train_fraction, calibration_fraction)
+    default_lightgbm_params: dict[str, int | float] = {
+        "n_estimators": 100,
+        "learning_rate": 0.05,
+        "num_leaves": 15,
+        "min_child_samples": max(2, min(20, len(split.train) // 10)),
+    }
+    if lightgbm_tuning is not None:
+        tuned = lightgbm_tuning.get("best_params")
+        if not isinstance(tuned, dict):
+            raise ValueError("LightGBM 网格搜索记录缺少 best_params")
+        if lightgbm_params is None:
+            lightgbm_params = tuned
+        elif any(lightgbm_params.get(name) != tuned.get(name) for name in tuned):
+            raise ValueError("LightGBM 参数与网格搜索胜出参数不一致")
+    selected_lightgbm_params = {
+        **default_lightgbm_params,
+        **(lightgbm_params or {}),
+    }
+    if set(selected_lightgbm_params) != set(default_lightgbm_params):
+        raise ValueError(
+            "LightGBM 参数必须且只能包含 n_estimators、learning_rate、"
+            "num_leaves 和 min_child_samples"
+        )
+    for name in ("n_estimators", "num_leaves", "min_child_samples"):
+        value = selected_lightgbm_params[name]
+        if float(value) != int(value) or int(value) < 1:
+            raise ValueError(f"LightGBM 参数 {name} 必须为正整数")
+        selected_lightgbm_params[name] = int(value)
+    if float(selected_lightgbm_params["learning_rate"]) <= 0:
+        raise ValueError("LightGBM 参数 learning_rate 必须大于 0")
+    selected_lightgbm_params["learning_rate"] = float(
+        selected_lightgbm_params["learning_rate"]
+    )
     train_matrix = _matrix(split.train)
     calibration_matrix = _matrix(split.calibration)
     test_matrix = _matrix(split.test)
@@ -461,9 +780,15 @@ def build_research_report(
 
     fit_started = time.perf_counter()
     lightgbm_model = LGBMClassifier(
-        objective="binary", n_estimators=100, learning_rate=0.05,
-        num_leaves=15, min_child_samples=max(2, min(20, len(split.train) // 10)),
-        random_state=seed, n_jobs=1, verbosity=-1,
+        objective="binary",
+        random_state=seed,
+        n_jobs=1,
+        verbosity=-1,
+        deterministic=True,
+        force_col_wise=True,
+        subsample=1.0,
+        colsample_bytree=1.0,
+        **selected_lightgbm_params,
     )
     lightgbm_model.fit(train_matrix, train_labels)
     lightgbm_fit_seconds = time.perf_counter() - fit_started
@@ -532,8 +857,13 @@ def build_research_report(
         "lightgbm": _evaluate_configuration(
             name="lightgbm", metadata={
                 "algorithm": "lightgbm_gbdt_classifier", "version": lightgbm.__version__,
-                "training_rows": len(split.train), "n_estimators": 100,
-                "num_leaves": 15, "seed": seed,
+                "training_rows": len(split.train), **selected_lightgbm_params,
+                "deterministic": True, "force_col_wise": True,
+                "subsample": 1.0, "colsample_bytree": 1.0, "seed": seed,
+                "hyperparameter_selection": (
+                    "nested_chronological_grid_search"
+                    if lightgbm_tuning is not None else "fixed_configuration"
+                ),
                 "explanation_method": "none_without_optional_shap_analysis",
             }, fit_seconds=lightgbm_fit_seconds, scorer=lightgbm_scorer,
             explanation_flags=never_explainable, **shared,
@@ -598,11 +928,24 @@ def build_research_report(
         warnings.append("SHAP 解释模型预测贡献，不代表网络特征与攻击之间存在因果关系。")
     if len(split.test) < 1000:
         warnings.append("独立测试集少于 1000 条；结果只能验证流程，不能作为论文结论。")
+    if lightgbm_tuning is not None:
+        warnings.append(
+            "LightGBM 参数仅由外层训练时段内部的拟合、校准和验证区间选择；"
+            "外层校准与独立测试区间未参与网格搜索。"
+        )
+        if not lightgbm_tuning.get("selection_constraint_met", False):
+            warnings.append(
+                "LightGBM 网格搜索没有候选满足内部验证 FPR 约束；已使用预先定义的回退规则。"
+            )
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
-        "method": "shared_chronological_train_calibration_test_fixed_fpr",
+        "method": (
+            "shared_chronological_train_calibration_test_fixed_fpr_with_nested_grid_search"
+            if lightgbm_tuning is not None else
+            "shared_chronological_train_calibration_test_fixed_fpr"
+        ),
         "feature_names": FEATURE_NAMES,
         "seed": seed,
         "target_false_positive_rates": list(normalized_targets),
@@ -618,7 +961,9 @@ def build_research_report(
             "train_ends_at": split.train[-1].timestamp,
             "calibration_starts_at": split.calibration[0].timestamp,
             "test_starts_at": split.test[0].timestamp,
+            "strict_timestamp_boundaries": True,
         },
+        "lightgbm_tuning": lightgbm_tuning,
         "configurations": configurations,
         "shap_analysis": shap_analysis,
         "ranking_at_primary_target": ranking,
@@ -857,7 +1202,19 @@ def _latency_svg(report: dict[str, object]) -> str:
 def _reproducibility_markdown(report: dict[str, object]) -> str:
     split = report["split"]
     targets = ", ".join(f"{value:g}" for value in report["target_false_positive_rates"])
-    return f"""# Research experiment record
+    tuning = report.get("lightgbm_tuning")
+    if tuning:
+        params = tuning["best_params"]
+        tuning_line = (
+            "- LightGBM selection: nested chronological grid search inside outer training; "
+            f"n_estimators={params['n_estimators']}, "
+            f"learning_rate={params['learning_rate']}, "
+            f"num_leaves={params['num_leaves']}, "
+            f"min_child_samples={params['min_child_samples']}"
+        )
+    else:
+        tuning_line = "- LightGBM selection: fixed configuration (no grid-search record)"
+    return f"""# Research run record
 
 This directory was generated by AI Firewall's `research-experiment` command.
 
@@ -867,11 +1224,95 @@ This directory was generated by AI Firewall's `research-experiment` command.
 - Target calibration FPRs: `{targets}`
 - Chronological split: {split['train_rows']} train / {split['calibration_rows']} calibration / {split['test_rows']} test rows
 - Independent test labels: {split['test_benign_rows']} benign / {split['test_attack_rows']} attack rows
+{tuning_line}
 
-The calibration interval is used only to choose thresholds. Metrics are reported on the later independent test interval. `metrics.csv` is the paper-ready table, while the SVG files are editable figures. The JSON report retains the complete machine-readable record.
+The calibration interval is used only to choose thresholds. Metrics are reported on the later independent test interval. If grid search is recorded, the outer calibration and independent test intervals did not participate in parameter selection. `metrics.csv` contains the tabular metrics, the SVG files contain editable figures, and the JSON report retains the complete machine-readable record.
 
 Do not describe these results as production performance. Dataset provenance, class balance, temporal coverage, hardware, software versions, and any sampling limit must be reported in the paper.
 """
+
+
+def _grid_search_candidates_csv(result: dict[str, object]) -> str:
+    fields = (
+        "n_estimators", "learning_rate", "num_leaves", "min_child_samples",
+        "status", "constraint_met", "validation_fpr", "validation_precision",
+        "validation_recall", "validation_f1", "validation_auprc",
+        "inner_calibration_fpr", "threshold", "fit_seconds", "error",
+    )
+    rows = [
+        {field: candidate.get(field) for field in fields}
+        for candidate in result["candidates"]
+    ]
+    return _rows_csv(rows, fields)
+
+
+def _grid_search_markdown(result: dict[str, object]) -> str:
+    params = result["best_params"]
+    metrics = result["best_validation"]
+    split = result["inner_split"]
+    constraint = "met" if result["selection_constraint_met"] else "not met"
+    lines = [
+        "# LightGBM nested chronological grid search",
+        "",
+        f"- Source: `{result.get('source')}`",
+        f"- Generated (UTC): `{result['generated_at']}`",
+        f"- Candidate configurations: {result['candidate_count']}",
+        f"- Inner split: {split['fit_rows']} fit / {split['calibration_rows']} "
+        f"threshold calibration / {split['validation_rows']} validation rows",
+        f"- Selection target: validation FPR <= "
+        f"{100.0 * float(result['target_false_positive_rate']):.2f}% ({constraint})",
+        "- Outer calibration and independent test accessed during search: no",
+        "",
+        "## Selected parameters",
+        "",
+        f"- `n_estimators={params['n_estimators']}`",
+        f"- `learning_rate={params['learning_rate']}`",
+        f"- `num_leaves={params['num_leaves']}`",
+        f"- `min_child_samples={params['min_child_samples']}`",
+        "",
+        "## Inner-validation result",
+        "",
+        f"- FPR: {100.0 * float(metrics['validation_fpr']):.4f}%",
+        f"- Recall: {100.0 * float(metrics['validation_recall']):.4f}%",
+        f"- F1: {100.0 * float(metrics['validation_f1']):.4f}%",
+        f"- AUPRC: {100.0 * float(metrics['validation_auprc']):.4f}%",
+        "",
+        result["selection_rule"],
+        "",
+        "The selected parameters are refitted on the complete outer training period. "
+        "The outer calibration period sets final thresholds, and the later outer test "
+        "period is used only for final evaluation.",
+        "",
+    ]
+    if result.get("warning"):
+        lines.extend([f"Warning: {result['warning']}", ""])
+    return "\n".join(lines)
+
+
+def write_lightgbm_grid_search_bundle(
+    result: dict[str, object], output_dir: str | Path, *, overwrite: bool = False,
+) -> list[Path]:
+    directory = Path(output_dir)
+    if directory.exists() and not directory.is_dir():
+        raise ValueError(f"输出路径不是目录: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        "lightgbm-grid-search.json": json.dumps(
+            result, ensure_ascii=False, indent=2,
+        ) + "\n",
+        "lightgbm-grid-search.csv": _grid_search_candidates_csv(result),
+        "LIGHTGBM_GRID_SEARCH.md": _grid_search_markdown(result),
+    }
+    paths = [directory / name for name in outputs]
+    existing = [path for path in paths if path.exists()]
+    if existing and not overwrite:
+        raise ValueError(
+            "网格搜索输出已存在；如需替换请添加 --overwrite: "
+            + ", ".join(str(path) for path in existing)
+        )
+    for path, content in zip(paths, outputs.values()):
+        _atomic_write(path, content, overwrite)
+    return paths
 
 
 def write_research_bundle(
@@ -956,6 +1397,7 @@ def aggregate_research_reports(
     reference_configs = set(reference["configurations"])
     reference_split = reference["split"]
     reference_source = reference.get("source")
+    reference_tuning = reference.get("lightgbm_tuning")
     for report in reports[1:]:
         if report["target_false_positive_rates"] != reference_targets:
             raise ValueError("多随机种子报告的目标 FPR 不一致")
@@ -965,6 +1407,8 @@ def aggregate_research_reports(
             raise ValueError("多随机种子报告的时间切分不一致")
         if report.get("source") != reference_source:
             raise ValueError("多随机种子报告的数据来源不一致")
+        if report.get("lightgbm_tuning") != reference_tuning:
+            raise ValueError("多随机种子报告的 LightGBM 网格搜索记录不一致")
 
     metric_names = (
         "false_positive_rate", "precision", "recall", "f1",
@@ -1016,6 +1460,7 @@ def aggregate_research_reports(
             "primary_target_false_positive_rate"
         ],
         "split": reference_split,
+        "lightgbm_tuning": reference_tuning,
         "statistics": rows,
         "seed_values": seed_values,
         "interpretation_warning": (
@@ -1048,7 +1493,7 @@ def _multiseed_markdown(aggregate: dict[str, object]) -> str:
         (row["configuration"], row["metric"]): row for row in selected
     }
     lines = [
-        "# Multi-seed robustness summary",
+        "# Multi-seed variation summary",
         "",
         f"Seeds: `{', '.join(str(seed) for seed in aggregate['seeds'])}`",
         f"Fixed chronological split: {aggregate['split']['train_rows']} train / "
@@ -1105,6 +1550,15 @@ def write_multiseed_bundle(
         ),
         "MULTISEED_SUMMARY.md": _multiseed_markdown(aggregate),
     }
+    tuning = aggregate.get("lightgbm_tuning")
+    if tuning:
+        outputs.update({
+            "lightgbm-grid-search.json": json.dumps(
+                tuning, ensure_ascii=False, indent=2,
+            ) + "\n",
+            "lightgbm-grid-search.csv": _grid_search_candidates_csv(tuning),
+            "LIGHTGBM_GRID_SEARCH.md": _grid_search_markdown(tuning),
+        })
     paths = [directory / name for name in outputs]
     existing = [path for path in paths if path.exists()]
     if existing and not overwrite:

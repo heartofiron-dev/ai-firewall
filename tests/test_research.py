@@ -9,6 +9,7 @@ from ai_firewall.research import (
     _average_precision,
     aggregate_research_reports,
     build_research_report,
+    grid_search_lightgbm,
     write_multiseed_bundle,
     write_research_bundle,
 )
@@ -79,6 +80,42 @@ class ResearchExperimentTests(unittest.TestCase):
             1.0,
         )
         json.dumps(report, allow_nan=False)
+
+    @unittest.skipUnless(OPTIONAL_MODELS_AVAILABLE, "comparison extras are not installed")
+    def test_nested_grid_search_uses_only_outer_training_period(self):
+        search = grid_search_lightgbm(
+            [flow(index) for index in range(80)],
+            grid={
+                "n_estimators": (5, 10),
+                "learning_rate": (0.05,),
+                "num_leaves": (3,),
+                "min_child_samples": (2,),
+            },
+            source="synthetic-grid-test",
+        )
+        self.assertEqual(search["candidate_count"], 2)
+        self.assertEqual(search["outer_split_access"]["training_rows_used"], 40)
+        self.assertFalse(
+            search["outer_split_access"]["algorithmic_search_accessed_outer_test"]
+        )
+        self.assertLess(
+            search["inner_split"]["fit_ends_at"],
+            search["inner_split"]["calibration_starts_at"],
+        )
+        self.assertLess(
+            search["inner_split"]["calibration_ends_at"],
+            search["inner_split"]["validation_starts_at"],
+        )
+        report = build_research_report(
+            [flow(index) for index in range(80)],
+            target_fprs=(0.01,),
+            lightgbm_tuning=search,
+        )
+        metadata = report["configurations"]["lightgbm"]["metadata"]
+        self.assertEqual(metadata["hyperparameter_selection"],
+                         "nested_chronological_grid_search")
+        for name, value in search["best_params"].items():
+            self.assertEqual(metadata[name], value)
 
     @unittest.skipUnless(OPTIONAL_MODELS_AVAILABLE, "comparison extras are not installed")
     def test_writes_machine_readable_table_and_editable_figures(self):

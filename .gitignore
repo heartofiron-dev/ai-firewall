@@ -36,3 +36,5 @@ venv/
 *.egg-info/
 build/
 dist/
+research-results/
+research-multiseed-results/

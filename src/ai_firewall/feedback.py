@@ -67,7 +67,7 @@ def review_feedback(
     alert_ids: set[str] | None = None,
     reviewer: str = "local-user",
 ) -> dict[str, int]:
-    """Append explicit human decisions with metadata-free training snapshots."""
+    """Append human review decisions and their numeric feature snapshots."""
     if decision not in DECISIONS:
         raise ValueError("decision 必须是 approve 或 reject")
     if len(reviewer) > 80 or not reviewer.strip():
@@ -150,7 +150,7 @@ def build_feedback_model(
     learning_rate: float = 0.08,
     max_feedback_fraction: float = 0.20,
 ) -> dict[str, object]:
-    """Retrain only from approved review records plus an authorized base set."""
+    """Retrain from an authorized base set and approved review records."""
     if not 0.0 < max_feedback_fraction <= 0.5:
         raise ValueError("max_feedback_fraction 必须在 0 和 0.5 之间")
     base = read_flows(base_csv)

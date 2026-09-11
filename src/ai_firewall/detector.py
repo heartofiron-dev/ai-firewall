@@ -33,7 +33,7 @@ class DetectionResult:
 
 
 class HybridDetector:
-    """Combines a small statistical model with transparent safety rules."""
+    """Combine the model score with explicit rule matches."""
 
     def __init__(self, model: LinearModel, threshold: float = 0.60):
         if not 0.0 < threshold < 1.0:
@@ -47,7 +47,7 @@ class HybridDetector:
         hits: list[RuleHit] = evaluate_rules(flow)
         rule_score = max((hit.score for hit in hits), default=0.0)
 
-        # A strong rule must remain visible even if a model is unfamiliar with it.
+        # Keep a high-confidence rule match above its configured score floor.
         combined = max(0.70 * model_score + 0.30 * rule_score, rule_score * 0.90)
         risk_score = min(max(combined, 0.0), 1.0)
 
@@ -62,9 +62,9 @@ class HybridDetector:
 
         reasons = [hit.reason for hit in hits]
         if not reasons and model_score >= self.threshold:
-            reasons.append("统计模型发现流量特征偏离正常模式")
+            reasons.append("模型分数已达到告警阈值")
         if not reasons:
-            reasons.append("未发现达到告警阈值的异常")
+            reasons.append("模型和规则分数均低于告警阈值")
 
         return DetectionResult(
             timestamp=flow.timestamp,

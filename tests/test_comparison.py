@@ -2,6 +2,7 @@ import importlib.util
 import json
 import unittest
 from argparse import Namespace
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from ai_firewall.comparison import build_model_comparison, chronological_model_split
@@ -45,6 +46,16 @@ class ComparisonTests(unittest.TestCase):
     def test_rejects_tiny_dataset(self):
         with self.assertRaisesRegex(ValueError, "至少需要 20"):
             chronological_model_split(self.flows[:19])
+
+    def test_equal_timestamp_group_stays_on_later_side_of_boundary(self):
+        same_timestamp = self.flows[30].timestamp
+        grouped = [
+            replace(item, timestamp=same_timestamp) if 28 <= index <= 32 else item
+            for index, item in enumerate(self.flows)
+        ]
+        split = chronological_model_split(grouped, 0.5, 0.2)
+        self.assertEqual(len(split.train), 28)
+        self.assertLess(split.train[-1].timestamp, split.calibration[0].timestamp)
 
     def test_cli_refuses_to_replace_input_csv(self):
         args = Namespace(

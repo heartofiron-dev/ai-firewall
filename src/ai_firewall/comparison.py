@@ -32,6 +32,17 @@ class ComparisonSplit:
     test: list[FlowRecord]
 
 
+def _move_boundary_to_timestamp_start(
+    timestamps: list[datetime], boundary: int, minimum: int,
+) -> int:
+    """Keep an equal-timestamp group wholly on the later side of a split."""
+    while boundary > minimum and timestamps[boundary - 1] == timestamps[boundary]:
+        boundary -= 1
+    if boundary <= minimum or timestamps[boundary - 1] >= timestamps[boundary]:
+        raise ValueError("时间戳分组过大，无法建立严格分离的时间区间")
+    return boundary
+
+
 def chronological_model_split(
     flows: list[FlowRecord], train_fraction: float = 0.5,
     calibration_fraction: float = 0.2,
@@ -45,11 +56,20 @@ def chronological_model_split(
     if len(flows) < 20:
         raise ValueError("模型对比至少需要 20 条按时间排序的带标签记录")
 
-    ordered = sorted(flows, key=lambda flow: _timestamp(flow.timestamp))
+    ordered_pairs = sorted(
+        ((_timestamp(flow.timestamp), flow) for flow in flows),
+        key=lambda item: item[0],
+    )
+    timestamps = [item[0] for item in ordered_pairs]
+    ordered = [item[1] for item in ordered_pairs]
     train_end = max(1, min(len(ordered) - 2, math.floor(len(ordered) * train_fraction)))
+    train_end = _move_boundary_to_timestamp_start(timestamps, train_end, 0)
     calibration_end = max(
         train_end + 1,
         min(len(ordered) - 1, math.floor(len(ordered) * (train_fraction + calibration_fraction))),
+    )
+    calibration_end = _move_boundary_to_timestamp_start(
+        timestamps, calibration_end, train_end,
     )
     split = ComparisonSplit(
         train=ordered[:train_end],
